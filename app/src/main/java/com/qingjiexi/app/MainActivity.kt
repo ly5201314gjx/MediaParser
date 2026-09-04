@@ -29,6 +29,8 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.view.animation.DecelerateInterpolator
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
@@ -145,8 +147,10 @@ class MainActivity : Activity() {
                                 if (dl != null) { updateFavDlCell(dl.historyId); return }
                             }
                             renderCurrent()
-                        } else if (pvMode == "detail" && st != DB.DL_DOWNLOADING) renderCurrent()
-                        else refreshAllAfterDownload()
+                        } else if (pvMode == "detail" && st != DB.DL_DOWNLOADING) {
+                            // 全屏 / 查看器 / 弹层打开时不重建详情页，避免打断播放与破坏全屏上下文
+                            if (fsHost == null && imgLayer.visibility != View.VISIBLE && !sheetShowing) renderCurrent()
+                        } else refreshAllAfterDownload()
                     }
                 }
             }
@@ -176,10 +180,16 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         try { unregisterReceiver(receiver) } catch (_: Exception) {}
+        for (v in liveVideos) v.release()
+        liveVideos.clear()
         super.onDestroy()
     }
 
-    override fun onResume() { super.onResume(); renderCurrent() }
+    override fun onResume() {
+        super.onResume()
+        // 全屏 / 图集查看器 / 弹层打开时不重建页面：避免打断播放、破坏全屏上下文
+        if (fsHost == null && imgLayer.visibility != View.VISIBLE && !sheetShowing) renderCurrent()
+    }
 
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
@@ -194,6 +204,7 @@ class MainActivity : Activity() {
             "recycle" -> { pvMode = "mine"; renderMine(); return }
             "detail" -> {
                 // 返回进入详情前的 Tab（从收藏进入 → 回到收藏，而不是跳回 tab1）
+                removeImmersive()
                 currentTab = tabBeforeDetail
                 pvMode = when (tabBeforeDetail) { 0 -> "home"; 1 -> "favorites"; else -> "mine" }
                 renderTabBar(); renderCurrent(); showTabBar(); return
@@ -529,6 +540,9 @@ class MainActivity : Activity() {
         val now = System.currentTimeMillis()
         lastRender = now
         selectChecks.clear()   // 页面重建后旧圆圈注册失效，由新构建的 cell 重新注册
+        // 页面重建前释放旧页内视频播放器（全屏中的 vv 由 fsHost 单独持有，此处重建流程保证 fsHost == null）
+        for (v in liveVideos) v.release()
+        liveVideos.clear()
         content.removeAllViews()
         val page = currentPage()
         // 底部悬浮栏（TabBar / 多选操作栏）覆盖在内容之上：
@@ -740,6 +754,7 @@ class MainActivity : Activity() {
                 onToggleFullscreen = { enterOrExitFullscreen(this) }
             }
             box.addView(vv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(170)))
+            liveVideos.add(vv)
             card.addView(box, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) })
             vv.load(videoPreviewUrls(b))
 
@@ -802,6 +817,12 @@ class MainActivity : Activity() {
     private var fsHost: HeaderVideoView? = null
     private var fsSavedParent: ViewGroup? = null
     private var fsSavedLp: ViewGroup.LayoutParams? = null
+    private var fsCloseBtn: View? = null
+    private var fsControlsVisible = true
+    private var fsPrevTabVis = View.GONE
+    private var fsPrevActionVis = View.GONE
+    /** 当前页面内全部视频预览实例：页面重建 / Activity 销毁前统一 release，避免 MediaPlayer 资源残留 */
+    private val liveVideos = ArrayList<HeaderVideoView>()
 
     /** 按视频原始比例摆放预览框：过长/过宽缩成迷你版（等比不拉伸），桌面宽幅居中。
   *  若播放器此刻在全屏层内，则等比铺满屏幕并居中。 */
@@ -821,33 +842,49 @@ class MainActivity : Activity() {
         v.layoutParams = lp
     }
 
-    /** 点击视频画面：进入 / 退出全屏 */
+    /** 点击视频画面：迷你态 → 进入全屏；全屏态 → 显示/隐藏控件（不再直接退出全屏） */
     private fun enterOrExitFullscreen(v: HeaderVideoView) {
-        if (fsHost === v) exitFullscreen() else enterFullscreen(v)
+        if (fsHost === v) toggleFsControls() else enterFullscreen(v)
     }
 
-    /** 进入全屏：把播放器视图移入全屏层，等比缩放居中，隐藏底部导航 */
+    private fun setFsControls(on: Boolean) {
+        val v = fsHost ?: return
+        fsControlsVisible = on
+        v.setControlsVisible(on)
+        fsCloseBtn?.visibility = if (on) View.VISIBLE else View.GONE
+    }
+
+    /** 全屏播放时点击画面：切换控件显示/隐藏（iOS 极简——点一下交互控件浮现，再点收起来） */
+    private fun toggleFsControls() { setFsControls(!fsControlsVisible) }
+
+    /** 进入全屏：把播放器视图移入全屏层，等比缩放居中，隐藏系统栏与玻璃栏 */
     private fun enterFullscreen(v: HeaderVideoView) {
         if (fsHost != null && fsHost !== v) exitFullscreen()
         fsHost = v
         fsSavedParent = v.parent as? ViewGroup
         fsSavedLp = v.layoutParams
+        fsPrevTabVis = tabBar.visibility
+        fsPrevActionVis = actionBar.visibility
         (v.parent as? ViewGroup)?.removeView(v)
         fsLayer.removeAllViews()
         v.layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         fsLayer.addView(v)
-        // 全屏右上角退出按钮（迷你化）
+        // 全屏右上角退出按钮（iOS 极简：深蓝灰半透明小圆钮 + 细白叉）
         val close = GlyphView(this).apply {
-            icon = "x"; tint = 0xFFFFFFFF.toInt(); strokeW = 1.9f
-            background = rnd(0x99000000.toInt(), 14)
-            setOnClickListener { exitFullscreen() }
+            icon = "x"; tint = 0xFFFFFFFF.toInt(); strokeW = 1.8f
+            background = rnd(0x7A111318.toInt(), 16)
+            setOnClickListener { if (fsHost != null) exitFullscreen() }
         }
+        fsCloseBtn = close
         fsLayer.addView(close, FrameLayout.LayoutParams(dp(32), dp(32), Gravity.TOP or Gravity.END)
             .apply { setMargins(0, dp(14), dp(12), 0) })
-        fsLayer.setOnClickListener { exitFullscreen() }
+        // 点击画面只切换控件显隐；退出全屏仅通过右上角按钮或系统返回键
+        fsLayer.setOnClickListener { toggleFsControls() }
         fsLayer.visibility = View.VISIBLE
         tabBar.visibility = View.GONE
         actionBar.visibility = View.GONE
+        addImmersive()
+        setFsControls(true)
         // 等比缩放适配屏幕，四周留黑边
         fsLayer.post { scaleVideoToScreen(v) }
     }
@@ -866,14 +903,16 @@ class MainActivity : Activity() {
         v.requestLayout()
     }
 
-    /** 退出全屏：把播放器移回原位置并恢复等比尺寸 */
+    /** 退出全屏：把播放器移回原位置并恢复等比尺寸，同时恢复之前的底栏状态 */
     private fun exitFullscreen() {
         val v = fsHost ?: return
         fsLayer.removeAllViews()
         fsLayer.visibility = View.GONE
         fsLayer.setOnClickListener(null)
-        tabBar.visibility = if (selectMode) View.GONE else View.VISIBLE
-        actionBar.visibility = if (selectMode) View.VISIBLE else View.GONE
+        removeImmersive()
+        // 按进入全屏前的状态恢复：详情页下回到详情（玻璃栏保持隐藏），其他场景按原样还原
+        tabBar.visibility = fsPrevTabVis
+        actionBar.visibility = fsPrevActionVis
         val parent = fsSavedParent
         if (parent != null) {
             v.layoutParams = fsSavedLp
@@ -881,6 +920,8 @@ class MainActivity : Activity() {
             fitVideoBox(v, v.videoW, v.videoH)
         }
         fsHost = null; fsSavedParent = null; fsSavedLp = null
+        fsCloseBtn = null
+        v.setControlsVisible(true)
     }
 
     // ---------- 音频试听 / 下载 ----------
@@ -1920,15 +1961,45 @@ class MainActivity : Activity() {
             setBackgroundColor(0x60000000)
             setOnClickListener { dismissSheet() }
         }
-        val sheet = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val sheet = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = rnd(CARD, 16)
+        }
 
-        // 标题 + 简介
-        sheet.addView(tv("轻解析", 18f, TXT, true, Gravity.CENTER),
+        // 标题 + 版本
+        sheet.addView(tv("关于轻解析", 18f, TXT, true, Gravity.CENTER),
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(22) })
         sheet.addView(tv("版本 $ver", 12f, 0xFFAEAEB2.toInt(), false, Gravity.CENTER),
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
-        sheet.addView(tv("一款 iOS 极简质感的多平台视频解析工具\n支持 抖音 / 快手 / 哔哩哔哩 / TikTok / 推特(X)\n解析、收藏、多线程分片下载一体，完全开源免费", 13.5f, TXT3, false, Gravity.CENTER),
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(14); leftMargin = dp(28); rightMargin = dp(28) })
+
+        // 可滚动内容区（内置滑动查看文本）
+        val scrollContent = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        fun section(title: String, body: String) {
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = rnd(CARD, 16)
+                setPadding(dp(14), dp(12), dp(14), dp(12))
+            }
+            card.addView(tv(title, 13.5f, TXT, true))
+            card.addView(tv(body, 13f, TXT3).apply { setLineSpacing(dp(4).toFloat(), 1f) },
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
+            scrollContent.addView(card, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { bottomMargin = dp(10) })
+        }
+        section("项目简介",
+            "轻解析是一款 iOS 极简质感的多平台视频解析下载工具，支持 抖音 / 快手 / 哔哩哔哩 / TikTok / X（推特）等主流平台。" +
+            "核心能力：一键解析高清直链、视频 / 图集 / 原声下载、多线程分片传输与后台断点续传、历史记录、收藏管理与回收站恢复。" +
+            "全程无广告、无账号体系，完全开源免费。")
+        section("原创性声明",
+            "本项目为开发者从零独立设计与实现：界面布局、矢量图标、交互动效均为 Canvas 自绘，未使用任何第三方 UI 框架；" +
+            "解析、下载、数据库等工程结构均为原创实现。全部代码公开托管于 GitHub，欢迎审阅、建议与贡献。")
+        section("免责声明",
+            "本应用仅用于个人学习与信息技术交流。解析内容版权归原作者及所属平台所有，请勿将本工具用于商业用途或传播侵权内容。" +
+            "因使用本应用产生的一切后果由使用者自行承担；如您的作品被解析并在应用中出现，请联系开源仓库作者，我们将在核实后协助处理。" +
+            "请勿下载、传播违反中国法律法规及平台规则的内容。")
+        section("技术栈",
+            "Android 原生 Kotlin（minSdk 24）· 自绘 View 体系与矢量图标（Canvas）· MediaPlayer 自定义 UA/Referer 直链预览 · " +
+            "前台服务 + 多线程分片断点下载 · SQLite（SQLiteOpenHelper）本地存储 · Gradle 构建，无任何第三方依赖。")
 
         // GitHub 链接行（两行卡：标题 + 完整仓库地址，点按跳转）
         val gh = LinearLayout(this).apply {
@@ -1950,10 +2021,17 @@ class MainActivity : Activity() {
         gh.addView(ghRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         gh.addView(tv(GITHUB_URL, 11f, BLUE),
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6); leftMargin = dp(48) })
-        sheet.addView(gh, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        scrollContent.addView(gh, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val scroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            addView(scrollContent, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        sheet.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
             .apply { topMargin = dp(16); leftMargin = dp(12); rightMargin = dp(12) })
 
-        // 取消
+        // 关闭（固定底部）
         val cancel = LinearLayout(this).apply {
             gravity = Gravity.CENTER
             background = rnd(CARD, 14)
@@ -1963,16 +2041,17 @@ class MainActivity : Activity() {
         cancel.addView(tv("关闭", 17f, TXT, true, Gravity.CENTER),
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 1f))
         sheet.addView(cancel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-            .apply { topMargin = dp(8); leftMargin = dp(12); rightMargin = dp(12); bottomMargin = dp(14) })
+            .apply { topMargin = dp(4); leftMargin = dp(12); rightMargin = dp(12); bottomMargin = dp(14) })
 
         sheetLayer.addView(overlay, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        val lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM)
+        val maxH = (resources.displayMetrics.heightPixels * 0.72).toInt().coerceAtLeast(dp(420))
+        val lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, maxH, Gravity.BOTTOM)
         lp.setMargins(dp(12), 0, dp(12), dp(12))
         sheetLayer.addView(sheet, lp)
 
         overlay.alpha = 0f
         overlay.animate().alpha(1f).setDuration(180).start()
-        sheet.translationY = dp(320).toFloat()
+        sheet.translationY = dp(520).toFloat()
         sheet.animate().translationY(0f).setDuration(280).setInterpolator(DecelerateInterpolator(2.6f)).start()
     }
 
@@ -2072,9 +2151,11 @@ class MainActivity : Activity() {
     private fun openDetail(b: MediaBean? = null) {
         b?.let { detailBean = it }
         if (detailBean == null) { toast("暂无详情"); return }
+        val wasDetail = pvMode == "detail"
         tabBeforeDetail = currentTab
         pvMode = "detail"
         tabBar.visibility = View.GONE
+        if (!wasDetail) addImmersive()
         renderCurrent()
     }
 
@@ -2163,6 +2244,7 @@ class MainActivity : Activity() {
                 onToggleFullscreen = { enterOrExitFullscreen(this) }
             }
             box.addView(vv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(180)))
+            liveVideos.add(vv)
             scroll.addView(box, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(16) })
             vv.load(videoPreviewUrls(b))
             scroll.addView(tv("点击画面全屏 · 控制条可暂停/倍速/下载", 11f, 0xFFC7C7CC.toInt()),
@@ -2277,16 +2359,16 @@ class MainActivity : Activity() {
         imgLayer.removeAllViews()
         imgPages = images.size
 
-        // 顶部：页码 + 关闭按钮
-        imgIndexTxt = tv("${pos + 1} / $imgPages", 13f, 0xFFFFFFFF.toInt(), true, Gravity.CENTER).apply {
-            setBackgroundColor(0x66000000)
+        // 顶部：页码 + 关闭按钮（iOS 极简：深蓝灰半透小胶囊 + 细白叉）
+        imgIndexTxt = tv("${pos + 1} / $imgPages", 12.5f, 0xFFFFFFFF.toInt(), true, Gravity.CENTER).apply {
+            background = rnd(0x7A111318.toInt(), 12)
             setPadding(dp(12), dp(5), dp(12), dp(5))
         }
         imgLayer.addView(imgIndexTxt!!, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
             .apply { topMargin = dp(16) })
         val close = GlyphView(this).apply {
-            icon = "x"; tint = 0xFFFFFFFF.toInt(); strokeW = 1.9f
-            background = rnd(0x99000000.toInt(), 14)
+            icon = "x"; tint = 0xFFFFFFFF.toInt(); strokeW = 1.8f
+            background = rnd(0x7A111318.toInt(), 16)
             setOnClickListener { closeImageViewer() }
         }
         imgLayer.addView(close, FrameLayout.LayoutParams(dp(32), dp(32), Gravity.TOP or Gravity.END)
@@ -2330,6 +2412,7 @@ class MainActivity : Activity() {
 
         imgLayer.alpha = 0f
         imgLayer.visibility = View.VISIBLE
+        addImmersive()
         imgLayer.animate().alpha(1f).setDuration(200).start()
 
         // 初始定位到点击的那一张
@@ -2344,6 +2427,7 @@ class MainActivity : Activity() {
     }
 
     private fun closeImageViewer() {
+        removeImmersive()
         imgPager = null
         imgLayer.animate().alpha(0f).setDuration(160).withEndAction {
             imgLayer.visibility = View.GONE
@@ -2550,6 +2634,48 @@ class MainActivity : Activity() {
 
     private fun renderMine() { pvMode = "mine"; renderTabBar(); renderCurrent(); showTabBar() }
     private fun showTabBar() { if (!selectMode) tabBar.visibility = View.VISIBLE }
+
+    // ---------- 沉浸式系统栏（隐藏底部导航 + 状态栏，返回逐层恢复） ----------
+    private var immersiveLayers = 0
+
+    /** 进入全屏/详情/查看器时隐藏系统栏；支持嵌套叠加（详情→查看器→全屏） */
+    private fun addImmersive() { immersiveLayers++; applySystemBars() }
+
+    /** 退出某一层全屏后恢复；仅当所有层都退出才显示系统栏 */
+    private fun removeImmersive() {
+        if (immersiveLayers > 0) immersiveLayers--
+        applySystemBars()
+    }
+
+    private fun applySystemBars() {
+        if (immersiveLayers > 0) hideSystemBars() else showSystemBars()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun hideSystemBars() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            runCatching {
+                window.insetsController?.apply {
+                    hide(WindowInsets.Type.systemBars())
+                    systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                }
+            }
+        } else {
+            runCatching {
+                window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                    View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+            }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun showSystemBars() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            runCatching { window.insetsController?.show(WindowInsets.Type.systemBars()) }
+        } else {
+            runCatching { window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE }
+        }
+    }
 
     // ---------- 多选批量操作 ----------
     private fun selectedHistoryBeans(): List<MediaBean> = when (selectKind) {

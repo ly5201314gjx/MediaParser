@@ -118,6 +118,29 @@ class HeaderVideoView(context: Context) : FrameLayout(context), SurfaceHolder.Ca
     private var prepared = false
     /** 用户期望的播放状态（暂停按钮会置 false；切回表面后据此恢复播放） */
     private var userWantsPlay = false
+    /** 用户期望的控件显隐（全屏下点画面切换；迷你态默认显示） */
+    private var userControlsVisible = true
+
+    /** 全屏层调用：切换底部控制条显隐（加载/失败态自动保持隐藏） */
+    fun setControlsVisible(vis: Boolean) {
+        userControlsVisible = vis
+        applyControlsVisibility()
+    }
+
+    private fun applyControlsVisibility() {
+        controlsBar.visibility = if (userControlsVisible && prepared) View.VISIBLE else View.GONE
+    }
+
+    /** 快退 / 快进（±5 秒），超界自动夹紧 */
+    fun seekBy(deltaSec: Int) {
+        val p = mp ?: return
+        if (!prepared) return
+        val dur = runCatching { p.duration }.getOrElse { 0 }.toLong()
+        val pos = runCatching { p.currentPosition }.getOrElse { 0 }.toLong()
+        val target = (pos + deltaSec * 1000L).coerceIn(0, dur.coerceAtLeast(pos))
+        runCatching { p.seekTo(target.toInt()) }
+        updateTimeText(target, dur)
+    }
 
     init {
         setBackgroundColor(0xFF000000.toInt())
@@ -144,21 +167,39 @@ class HeaderVideoView(context: Context) : FrameLayout(context), SurfaceHolder.Ca
         overlay.visibility = View.GONE
         addView(overlay, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
-        // 底部控制条：播放/暂停 · 倍速 · 下载（迷你化 iOS 悬浮胶囊，白图标衬深色底，
-        // 避免线条图标漂浮在亮色上显出"空心白框"）
+        // 底部控制条：播放/暂停 · 快退/快进 5s · 倍速 · 下载（iOS 极简悬浮胶囊，
+        // 深蓝灰半透底 + 亮白控件，避免纯黑死板）
         controlsBar = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(8), dp(5), dp(8), dp(5))
             visibility = View.GONE
             isClickable = true
-            background = rndBkg(0x8C000000.toInt(), 14)
+            background = rndBkg(0xA314181F.toInt(), 14)
         }
         playBtn = GlyphView(context).apply {
             icon = "pause"; tint = 0xFFFFFFFF.toInt(); strokeW = 1.7f
             setOnClickListener { togglePlay() }
         }
-        controlsBar.addView(playBtn, LinearLayout.LayoutParams(dp(26), dp(26)))
+        controlsBar.addView(playBtn, LinearLayout.LayoutParams(dp(24), dp(24)))
+        // 快退 5 秒
+        val rwdBtn = TextView(context).apply {
+            text = "−5"; textSize = 11f; setTextColor(0xFFFFFFFF.toInt())
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            gravity = Gravity.CENTER
+            setOnClickListener { seekBy(-5) }
+        }
+        rwdBtn.setPadding(dp(6), dp(3), dp(6), dp(3))
+        controlsBar.addView(rwdBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(8) })
+        // 快进 5 秒
+        val fwdBtn = TextView(context).apply {
+            text = "+5"; textSize = 11f; setTextColor(0xFFFFFFFF.toInt())
+            setTypeface(null, android.graphics.Typeface.BOLD)
+            gravity = Gravity.CENTER
+            setOnClickListener { seekBy(5) }
+        }
+        fwdBtn.setPadding(dp(6), dp(3), dp(6), dp(3))
+        controlsBar.addView(fwdBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(8) })
         speedBtn = TextView(context).apply {
             text = "1x"; textSize = 11f; setTextColor(0xFFFFFFFF.toInt())
             setTypeface(null, android.graphics.Typeface.BOLD)
@@ -249,6 +290,7 @@ class HeaderVideoView(context: Context) : FrameLayout(context), SurfaceHolder.Ca
         opened = false
         prepared = false
         userWantsPlay = false
+        userControlsVisible = true
         showLoading()
         if (surfaceReady) openInternal()
     }
@@ -326,7 +368,7 @@ class HeaderVideoView(context: Context) : FrameLayout(context), SurfaceHolder.Ca
         spin.visibility = View.VISIBLE
         ovIcon.visibility = View.GONE
         ovText.text = "视频缓冲中…"
-        controlsBar.visibility = View.GONE
+        applyControlsVisibility()
     }
 
     private fun showError(msg: String) {
@@ -334,7 +376,7 @@ class HeaderVideoView(context: Context) : FrameLayout(context), SurfaceHolder.Ca
         spin.visibility = View.GONE
         ovIcon.visibility = View.VISIBLE
         ovText.text = msg
-        controlsBar.visibility = View.GONE
+        applyControlsVisibility()
         onError?.invoke(msg)
     }
 
@@ -365,7 +407,7 @@ class HeaderVideoView(context: Context) : FrameLayout(context), SurfaceHolder.Ca
                     onVideoSize?.invoke(vw, vh)
                 }
                 overlay.visibility = View.GONE
-                controlsBar.visibility = View.VISIBLE
+                applyControlsVisibility()
                 updatePlayBtn()
                 updateProgressUi()
                 uiHandler.removeCallbacks(progressTick)
