@@ -73,5 +73,5 @@ app/
 
 ## 版本
 
-- 当前版本：`1.0.0`（详见 [CHANGELOG.md](CHANGELOG.md)）
+- 当前版本：`1.0.1`（详见 [CHANGELOG.md](CHANGELOG.md)）
 - 包名：`com.qingjiexi.app`
