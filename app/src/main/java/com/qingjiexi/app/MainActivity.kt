@@ -76,6 +76,9 @@ class MainActivity : Activity() {
         val TEAL = 0xFF00B8AE.toInt()
         val PINK = 0xFFFB7299.toInt()
 
+        /** 开源仓库主页（“我的”页脚与“关于轻解析”面板共用） */
+        const val GITHUB_URL = "https://github.com/ly5201314gjx/MediaParser"
+
         fun platformColor(p: String): Int = when (p) {
             "douyin" -> 0xFFFE2C55.toInt()
             "kuaishou" -> 0xFFFF4906.toInt()
@@ -91,6 +94,8 @@ class MainActivity : Activity() {
     private var selectMode = false
     private var selectKind = ""          // history / favorites / recycle / downloaded
     private val selected = LinkedHashSet<Long>()
+    /** 多选圆圈注册表：id → 当前页面上的选中圆圈 View（局部更新免整页重建 → 不再闪动/回顶） */
+    private val selectChecks = HashMap<Long, View>()
     private var favCategoryFilter = -1L   // -1 全部
     private var historySegment = 0        // 0 全部 1 下载中 2 已下载
     private var pvMode = ""               // 当前可见子页面
@@ -106,6 +111,8 @@ class MainActivity : Activity() {
     private var imgPager: HorizontalScrollView? = null
     private var imgIndexTxt: TextView? = null
     private var imgPages = 0
+    /** 图片查看器是否因全屏临时隐藏了底部玻璃栏（关闭后需还原） */
+    private var viewerHidTabBar = false
 
     private lateinit var content: FrameLayout
     private lateinit var sheetLayer: FrameLayout
@@ -130,8 +137,15 @@ class MainActivity : Activity() {
                         onParseDone(ok, hid, err)
                     } else if (intent.hasExtra(MediaService.EXTRA_DL_ID)) {
                         val st = intent.getIntExtra(MediaService.EXTRA_DL_STATUS, -1)
-                        // 详情页：仅在状态切换（失败/暂停/完成）时重建，避免下载进度广播频繁打断播放
-                        if (pvMode == "detail" && st != DB.DL_DOWNLOADING) renderCurrent()
+                        val did = intent.getLongExtra(MediaService.EXTRA_DL_ID, -1)
+                        // 收藏页：只局部刷新对应条目的下载状态（实时进度且不闪动/不回顶）
+                        if (pvMode == "favorites" && !selectMode) {
+                            if (did > 0) {
+                                val dl = DB.downloadById(did)
+                                if (dl != null) { updateFavDlCell(dl.historyId); return }
+                            }
+                            renderCurrent()
+                        } else if (pvMode == "detail" && st != DB.DL_DOWNLOADING) renderCurrent()
                         else refreshAllAfterDownload()
                     }
                 }
@@ -302,13 +316,29 @@ class MainActivity : Activity() {
     private fun chevron(): GlyphView = glyph("chevron", 0xFFC7C7CC.toInt(), 2f, 16)
 
     /** 多选圆圈：选中时显示对勾 */
-    private fun selCheck(sel: Boolean, color: Int): View {
+    private fun selCheck(sel: Boolean, color: Int): FrameLayout {
         val f = FrameLayout(this).apply {
             background = rnd(if (sel) color else 0xFFE5E5EA.toInt(), 12)
         }
         if (sel) f.addView(glyph("check", Color.WHITE, 2.2f, 13),
             FrameLayout.LayoutParams(dp(13), dp(13), Gravity.CENTER))
         return f
+    }
+
+    /** 局部刷新选中圆圈（多选时只更新该圆点，不重建整页 → 列表不闪动、不回到置顶） */
+    private fun applySelCheck(v: View, sel: Boolean, color: Int) {
+        val f = v as? FrameLayout ?: return
+        (f.background as? GradientDrawable)?.setColor(if (sel) color else 0xFFE5E5EA.toInt())
+        f.removeAllViews()
+        if (sel) f.addView(glyph("check", Color.WHITE, 2.2f, 13),
+            FrameLayout.LayoutParams(dp(13), dp(13), Gravity.CENTER))
+    }
+
+    /** 当前多选模式的圆圈主题色 */
+    private fun selectColor(): Int = when (selectKind) {
+        "favorites" -> CORAL
+        "history", "downloaded" -> BLUE
+        else -> RED
     }
 
     // ---------- 底部 TabBar（真液态玻璃，对照 legado-with-MD3 AppNavigationBar 配方） ----------
@@ -472,7 +502,12 @@ class MainActivity : Activity() {
         actionBar.visibility = View.GONE
         renderTabBar(); renderCurrent()
     }
-    private fun toggleSelect(id: Long) { if (!selected.remove(id)) selected.add(id); renderActionBar(); renderCurrent() }
+    private fun toggleSelect(id: Long) {
+        // 只局部刷新：更新圆圈选中态 + 操作栏计数，不重建整页 → 列表不再闪动/回到置顶
+        if (!selected.remove(id)) selected.add(id)
+        selectChecks[id]?.let { applySelCheck(it, selected.contains(id), selectColor()) }
+        renderActionBar()
+    }
 
     // ---------- 页面切换 ----------
     private fun switchTo(i: Int) {
@@ -493,6 +528,7 @@ class MainActivity : Activity() {
     private fun renderCurrent() {
         val now = System.currentTimeMillis()
         lastRender = now
+        selectChecks.clear()   // 页面重建后旧圆圈注册失效，由新构建的 cell 重新注册
         content.removeAllViews()
         val page = currentPage()
         // 底部悬浮栏（TabBar / 多选操作栏）覆盖在内容之上：
@@ -1242,6 +1278,45 @@ class MainActivity : Activity() {
         return m
     }
 
+    /** 收藏条目下载状态视图（进度 / 暂停 / 失败 / 等待 / 已下载），供收藏 cell 与广播局部刷新共用 */
+    private fun buildDlInfoInner(dl: DownloadBean): LinearLayout {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        when (dl.status) {
+            DB.DL_DOWNLOADING -> {
+                val p = if (dl.totalSize > 0) ((dl.downloadedSize * 100) / dl.totalSize).toInt().coerceIn(0, 100) else 0
+                box.addView(tv("下载中 $p%", 11f, BLUE, true))
+                box.addView(progressBar(p), LinearLayout.LayoutParams(0, dp(6), 1f).apply { leftMargin = dp(10) })
+            }
+            DB.DL_PAUSED -> box.addView(tv("已暂停 · 进入详情继续", 11f, ORANGE, true))
+            DB.DL_FAILED -> box.addView(tv("下载失败 · 进入详情重试", 11f, RED, true))
+            DB.DL_WAITING -> box.addView(tv("等待下载", 11f, TXT3, true))
+            DB.DL_DONE -> box.addView(tv("已下载到本地", 11f, GREEN, true))
+        }
+        return box
+    }
+
+    /** 按 tag 在视图树中查找（收藏页下载广播局部刷新用） */
+    private fun findViewByTag(root: View?, tag: String): View? {
+        root ?: return null
+        if (root.tag == tag) return root
+        if (root is ViewGroup)
+            for (i in 0 until root.childCount) {
+                findViewByTag(root.getChildAt(i), tag)?.let { return it }
+            }
+        return null
+    }
+
+    /** 收藏页：仅更新某条收藏的下载状态视图（不重建整页，避免闪动回顶） */
+    private fun updateFavDlCell(hid: Long) {
+        val dl = statusesOf()[hid] ?: return
+        val info = findViewByTag(content, "dlInfo:$hid") as? LinearLayout ?: return
+        info.removeAllViews()
+        info.addView(buildDlInfoInner(dl))
+    }
+
     private fun platformName(p: String): String = when (p) {
         "douyin" -> "抖音"; "kuaishou" -> "快手"; "twitter" -> "推特/X"; "bilibili" -> "哔哩哔哩"; "tiktok" -> "TikTok"
         else -> p.ifEmpty { "其他" }
@@ -1257,8 +1332,11 @@ class MainActivity : Activity() {
         press(cell)  // 阻尼按压缩放（真弹簧）
 
         // 多选圆圈
-        if (selectMode) cell.addView(selCheck(selected.contains(b.id), BLUE),
-            LinearLayout.LayoutParams(dp(24), dp(24)).apply { rightMargin = dp(12) })
+        if (selectMode) {
+            val ck = selCheck(selected.contains(b.id), BLUE)
+            selectChecks[b.id] = ck
+            cell.addView(ck, LinearLayout.LayoutParams(dp(24), dp(24)).apply { rightMargin = dp(12) })
+        }
 
         // 封面
         val cover = ImageView(this).apply {
@@ -1588,8 +1666,12 @@ class MainActivity : Activity() {
         cell.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         press(cell)  // 阻尼按压缩放（真弹簧）
 
-        if (selectMode) cell.addView(selCheck(selected.contains(f.id), CORAL),
-            LinearLayout.LayoutParams(dp(24), dp(24)).apply { rightMargin = dp(12) })
+        if (selectMode) {
+            val ck = selCheck(selected.contains(f.id), CORAL)
+            selectChecks[f.id] = ck
+            cell.addView(ck,
+                LinearLayout.LayoutParams(dp(24), dp(24)).apply { rightMargin = dp(12) })
+        }
         val cover = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP; background = rnd(0xFFF2F2F7.toInt(), 12) }
         ImageLoader.load(b.cover, cover)
         cell.addView(cover, LinearLayout.LayoutParams(dp(54), dp(54)))
@@ -1604,6 +1686,17 @@ class MainActivity : Activity() {
         textCol.addView(sub, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
         textCol.addView(tv("收藏于 " + fmtTime(f.createdAt), 10.5f, 0xFFC7C7CC.toInt()),
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(3) })
+
+        // 下载状态区（实时进度 / 暂停 / 失败 / 已下载），tag 供下载广播局部刷新，不重建整页
+        statusesOf()[b.id]?.let { dl ->
+            val dlInfo = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                tag = "dlInfo:${b.id}"
+            }
+            dlInfo.addView(buildDlInfoInner(dl))
+            textCol.addView(dlInfo, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
+        }
         cell.addView(textCol, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(12) })
 
         cell.addView(glyph("star", GOLD, 1.6f, 16), LinearLayout.LayoutParams(dp(16), dp(16)))
@@ -1731,49 +1824,156 @@ class MainActivity : Activity() {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         col.addView(TextView(this).apply { text = " "; textSize = 4f })
 
-        val recycleCount = DB.recycled().size
+        val ver = runCatching { packageManager.getPackageInfo(packageName, 0).versionName }
+            .getOrDefault("1.0.0")
 
-        // 功能列表：单个圆角容器 + 细分割线
-        val group = LinearLayout(this).apply {
+        // ---- 顶部：应用卡片（图标 + 名称 + 版本） ----
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = rnd(CARD, 16)
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+        }
+        val appIcon = ImageView(this).apply { setImageResource(R.mipmap.ic_launcher) }
+        header.addView(appIcon, LinearLayout.LayoutParams(dp(56), dp(56)))
+        val hCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        hCol.addView(tv("轻解析", 19f, TXT, true))
+        hCol.addView(tv("iOS 极简质感 · 多平台视频解析", 12f, TXT3),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(3) })
+        hCol.addView(tv("版本 $ver", 11.5f, 0xFFC7C7CC.toInt()),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
+        header.addView(hCol, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(14) })
+        col.addView(header, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        // ---- 设置分组卡片（统一圆角白卡 + 细分割线） ----
+        fun groupCard(): LinearLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = rnd(CARD, 16)
             setPadding(dp(6), dp(4), dp(6), dp(4))
         }
-        fun row(icon: String, iconColor: Int, title: String, sub: String, onClick: (View) -> Unit, last: Boolean = false) {
-            val r = LinearLayout(this@MainActivity).apply {
+        fun row(g: LinearLayout, icon: String, iconColor: Int, title: String, sub: String,
+                onClick: (View) -> Unit, last: Boolean = false) {
+            val r = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(8), dp(2), dp(8), dp(2))
                 setOnClickListener(onClick)
             }
-            val iconBg = FrameLayout(this@MainActivity).apply { background = rnd(iconColor, 12) }
+            press(r)
+            val iconBg = FrameLayout(this).apply { background = rnd(iconColor, 12) }
             iconBg.addView(glyph(icon, Color.WHITE, 1.8f, 20), FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER))
             r.addView(iconBg, LinearLayout.LayoutParams(dp(38), dp(38)).apply { rightMargin = dp(12) })
-            val tCol = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+            val tCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
             tCol.addView(tv(title, 15f, TXT, true))
             tCol.addView(tv(sub, 12f, TXT3), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(2) })
             r.addView(tCol, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             r.addView(chevron(), LinearLayout.LayoutParams(dp(16), dp(16)))
-            group.addView(r, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(60)))
-            if (!last) group.addView(hairline(this@MainActivity),
+            g.addView(r, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(60)))
+            if (!last) g.addView(hairline(this),
                 LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply { leftMargin = dp(58) })
         }
-        row("bin", RED, "回收站", if (recycleCount > 0) "$recycleCount 条记录可恢复" else "暂无记录",
-            { pvMode = "recycle"; renderCurrent() })
-        row("bolt", ORANGE, "电池后台运行权限", "允许后台持续解析与下载（建议开启）",
-            { requestBatteryOptimization() })
-        row("bell", BLUE, "通知权限", "解析与下载进度实时通知",
-            { requestPermissionsAtLaunch() }, last = true)
-        col.addView(group, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
 
-        val about = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; background = rnd(CARD, 16); setPadding(dp(16), dp(14), dp(16), dp(14)) }
-        about.addView(tv("关于轻解析", 14f, TXT, true))
-        about.addView(tv("Rust 解析核心 + Kotlin 客户端\n支持 抖音 / 快手 / 哔哩哔哩 / TikTok / 推特\n版本 2.0", 12.5f, TXT3),
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
-        col.addView(about, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) })
+        val recycleCount = DB.recycled().size
+        val gData = groupCard()
+        row(gData, "bin", RED, "回收站", if (recycleCount > 0) "$recycleCount 条记录可恢复" else "暂无记录",
+            { pvMode = "recycle"; renderCurrent() }, last = true)
+        col.addView(gData, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) })
+
+        val gPower = groupCard()
+        row(gPower, "bolt", ORANGE, "电池后台运行权限", "允许后台持续解析与下载（建议开启）",
+            { requestBatteryOptimization() })
+        row(gPower, "bell", BLUE, "通知权限", "解析与下载进度实时通知",
+            { requestPermissionsAtLaunch() }, last = true)
+        col.addView(gPower, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) })
+
+        val gAbout = groupCard()
+        row(gAbout, "info", BLUE, "关于轻解析", "版本 $ver · 介绍与开源项目",
+            { showAboutSheet() }, last = true)
+        col.addView(gAbout, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) })
+
+        // 底部：开源声明
+        val foot = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER }
+        foot.addView(tv("轻解析 · 开源免费", 11.5f, TXT3, false, Gravity.CENTER),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(22) })
+        foot.addView(tv(GITHUB_URL.removePrefix("https://"), 11f, BLUE, false, Gravity.CENTER),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
+        col.addView(foot, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         col.addView(TextView(this).apply { text = " "; textSize = 3f })
         return scrolled { col }
+    }
+
+    /** 关于面板：App 介绍 + 开源仓库链接（与全局 ActionSheet 同款 iOS 极简风） */
+    private fun showAboutSheet() {
+        val ver = runCatching { packageManager.getPackageInfo(packageName, 0).versionName }
+            .getOrDefault("1.0.0")
+        dismissSheet()
+        sheetShowing = true
+        val myToken = ++sheetToken
+        sheetLayer.removeAllViews()
+        sheetLayer.alpha = 1f
+        sheetLayer.visibility = View.VISIBLE
+        sheetHidTabBar = tabBar.visibility == View.VISIBLE
+        if (sheetHidTabBar) tabBar.visibility = View.GONE
+
+        val overlay = View(this).apply {
+            setBackgroundColor(0x60000000)
+            setOnClickListener { dismissSheet() }
+        }
+        val sheet = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        // 标题 + 简介
+        sheet.addView(tv("轻解析", 18f, TXT, true, Gravity.CENTER),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(22) })
+        sheet.addView(tv("版本 $ver", 12f, 0xFFAEAEB2.toInt(), false, Gravity.CENTER),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
+        sheet.addView(tv("一款 iOS 极简质感的多平台视频解析工具\n支持 抖音 / 快手 / 哔哩哔哩 / TikTok / 推特(X)\n解析、收藏、多线程分片下载一体，完全开源免费", 13.5f, TXT3, false, Gravity.CENTER),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(14); leftMargin = dp(28); rightMargin = dp(28) })
+
+        // GitHub 链接行（两行卡：标题 + 完整仓库地址，点按跳转）
+        val gh = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = rnd(CARD, 14)
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            setOnClickListener {
+                runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(GITHUB_URL))) }
+            }
+        }
+        press(gh)
+        val ghRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val ghIcon = FrameLayout(this).apply { background = rnd(0xFF24292F.toInt(), 12) }
+        ghIcon.addView(glyph("link", Color.WHITE, 1.7f, 18), FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER))
+        ghRow.addView(ghIcon, LinearLayout.LayoutParams(dp(36), dp(36)).apply { rightMargin = dp(12) })
+        ghRow.addView(tv("开源项目 · GitHub", 14f, TXT, true),
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        ghRow.addView(chevron(), LinearLayout.LayoutParams(dp(15), dp(15)))
+        gh.addView(ghRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        gh.addView(tv(GITHUB_URL, 11f, BLUE),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6); leftMargin = dp(48) })
+        sheet.addView(gh, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            .apply { topMargin = dp(16); leftMargin = dp(12); rightMargin = dp(12) })
+
+        // 取消
+        val cancel = LinearLayout(this).apply {
+            gravity = Gravity.CENTER
+            background = rnd(CARD, 14)
+            setOnClickListener { dismissSheet() }
+        }
+        press(cancel)
+        cancel.addView(tv("关闭", 17f, TXT, true, Gravity.CENTER),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 1f))
+        sheet.addView(cancel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            .apply { topMargin = dp(8); leftMargin = dp(12); rightMargin = dp(12); bottomMargin = dp(14) })
+
+        sheetLayer.addView(overlay, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        val lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM)
+        lp.setMargins(dp(12), 0, dp(12), dp(12))
+        sheetLayer.addView(sheet, lp)
+
+        overlay.alpha = 0f
+        overlay.animate().alpha(1f).setDuration(180).start()
+        sheet.translationY = dp(320).toFloat()
+        sheet.animate().translationY(0f).setDuration(280).setInterpolator(DecelerateInterpolator(2.6f)).start()
     }
 
     private fun buildRecyclePage(): View {
@@ -1823,8 +2023,12 @@ class MainActivity : Activity() {
             }
             cell.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
             press(cell)  // 阻尼按压缩放（真弹簧）
-            if (selectMode) cell.addView(selCheck(selected.contains(r.id), RED),
-                LinearLayout.LayoutParams(dp(24), dp(24)).apply { rightMargin = dp(12) })
+            if (selectMode) {
+                val ck = selCheck(selected.contains(r.id), RED)
+                selectChecks[r.id] = ck
+                cell.addView(ck,
+                    LinearLayout.LayoutParams(dp(24), dp(24)).apply { rightMargin = dp(12) })
+            }
             val kindBg = FrameLayout(this).apply { background = rnd(if (r.kind == "history") PURPLE else BLUE, 11) }
             kindBg.addView(glyph(if (r.kind == "history") "play" else "download", Color.WHITE, 1.9f, 17),
                 FrameLayout.LayoutParams(dp(17), dp(17), Gravity.CENTER))
@@ -2066,6 +2270,9 @@ class MainActivity : Activity() {
     /** 打开全屏图片查看器：横向滑动轮换 + 双击/捏合缩放，顶部显示页码 */
     private fun openImageViewer(images: List<String>, pos: Int) {
         dismissSheet()
+        // 全屏查看器须盖住底部玻璃栏，否则玻璃遮罩会挡到查看器底部的组件
+        viewerHidTabBar = tabBar.visibility == View.VISIBLE
+        if (viewerHidTabBar) tabBar.visibility = View.GONE
         if (images.isEmpty()) return
         imgLayer.removeAllViews()
         imgPages = images.size
@@ -2141,6 +2348,11 @@ class MainActivity : Activity() {
         imgLayer.animate().alpha(0f).setDuration(160).withEndAction {
             imgLayer.visibility = View.GONE
             imgLayer.removeAllViews()
+            // 收起后恢复底部玻璃栏（仅当进入查看器前是显示的）
+            if (viewerHidTabBar) {
+                viewerHidTabBar = false
+                if (!selectMode && !sheetShowing) tabBar.visibility = View.VISIBLE
+            }
         }.start()
     }
 

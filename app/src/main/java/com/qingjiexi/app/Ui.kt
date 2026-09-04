@@ -650,6 +650,21 @@ class GlyphView(context: Context) : View(context) {
                 c.drawCircle(18f, 16.6f, 1.8f, fp)
                 seg(19.8f, 16.6f, 20.4f, 16.6f)
             }
+            "info" -> {
+                c.drawCircle(12f, 12f, 8.2f, p)
+                seg(12f, 8.2f, 12f, 8.7f)
+                seg(12f, 11.2f, 12f, 16.4f)
+                c.drawCircle(12f, 8.4f, 0.9f, fp)
+            }
+            "eye" -> {
+                path.reset(); path.moveTo(3.4f, 12f)
+                path.cubicTo(6.2f, 7.2f, 9.2f, 5f, 12f, 5f)
+                path.cubicTo(14.8f, 5f, 17.8f, 7.2f, 20.6f, 12f)
+                path.cubicTo(17.8f, 16.8f, 14.8f, 19f, 12f, 19f)
+                path.cubicTo(9.2f, 19f, 6.2f, 16.8f, 3.4f, 12f)
+                c.drawPath(path, p)
+                c.drawCircle(12f, 12f, 3f, p)
+            }
         }
     }
 }
