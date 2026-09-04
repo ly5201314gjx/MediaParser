@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">轻解析</string>
+    <color name="bg_color">#F2F2F7</color>
+    <color name="accent">#0A84FF</color>
+    <color name="card_bg">#FFFFFF</color>
+    <color name="text_main">#1D1D1F</color>
+    <color name="text_sub">#8E8E93</color>
+    <color name="ic_launcher_background">#FF6B57</color>
+</resources>
