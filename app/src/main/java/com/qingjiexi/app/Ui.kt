@@ -144,10 +144,18 @@ class HeaderVideoView(context: Context) : FrameLayout(context), SurfaceHolder.Ca
     }
 
     init {
-        setBackgroundColor(0xFF000000.toInt())
+        setBackgroundColor(0xFF0E1116.toInt())
         surfaceView = SurfaceView(context)
         surfaceView.holder.addCallback(this)
         addView(surfaceView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+        // 顶部液态玻璃遮罩：半透深蓝黑向下渐隐，替代生硬黑边／黑块，观感接近 iOS 毛玻璃
+        val frost = View(context)
+        frost.background = android.graphics.drawable.GradientDrawable(
+            android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(0xB3141920.toInt(), 0x55141920.toInt(), 0x00141920.toInt())
+        )
+        addView(frost, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54), Gravity.TOP))
 
         overlay = FrameLayout(context).apply { setBackgroundColor(0x55000000) }
         spin = ProgressBar(context).apply { isIndeterminate = true }
@@ -443,7 +451,14 @@ class HeaderVideoView(context: Context) : FrameLayout(context), SurfaceHolder.Ca
                 }
                 true
             }
-            p.setAudioStreamType(android.media.AudioManager.STREAM_MUSIC)
+            p.setAudioAttributes(
+                android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MOVIE)
+                    .build()
+            )
+            // 显式指定媒体音量满值：防御部分 ROM 倍速回写 / 音量策略把预览音量清零
+            runCatching { p.setVolume(1f, 1f) }
             if (speed != 1f) runCatching { p.playbackParams = p.playbackParams.setSpeed(speed) }
             p.prepareAsync()
         } catch (e: IOException) {

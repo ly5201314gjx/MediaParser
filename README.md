@@ -36,7 +36,7 @@
 直接下载最新 APK 安装（支持 Android 7.0+，`minSdk 24`）：
 
 - 最新版 **v1.1.0**：[app-release.apk](release/app-release.apk)（或前往 [Releases](https://github.com/ly5201314gjx/MediaParser/releases) 页下载）
-- 临时下载（保留 3 天）：https://share.lg0304.xyz/f/0f6728a4-266c-4076-8850-464bcd9cb190
+- 临时下载（保留 3 天）：https://share.lg0304.xyz/f/529dc5cd-1081-4bce-add1-9e91e9e47372
 
 > 安装包使用 debug 签名，首次安装需允许"未知来源"。
 

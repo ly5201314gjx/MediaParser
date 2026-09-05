@@ -293,10 +293,10 @@ class MainActivity : Activity() {
         sheetLayer = FrameLayout(this)
         sheetLayer.visibility = View.GONE
         fsLayer = FrameLayout(this)
-        fsLayer.setBackgroundColor(0xFF000000.toInt())
+        fsLayer.setBackgroundColor(0xFF0E1116.toInt())
         fsLayer.visibility = View.GONE
         imgLayer = FrameLayout(this)
-        imgLayer.setBackgroundColor(0xFF000000.toInt())
+        imgLayer.setBackgroundColor(0xFF0E1116.toInt())
         imgLayer.visibility = View.GONE
         body.addView(content, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         body.addView(sheetLayer, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
@@ -815,7 +815,7 @@ class MainActivity : Activity() {
                 gravity = Gravity.CENTER_HORIZONTAL
             }
             val vv = HeaderVideoView(this).apply {
-                setBackgroundColor(0xFF000000.toInt())
+                setBackgroundColor(0xFF0E1116.toInt())
                 this.autoPlay = autoPlay   // 多卡并行时仅首卡自动播放，其余点击后播放
                 onError = { true }
                 onRetry = { toast("链接可能已过期，可回到输入框重新解析") }
@@ -2554,7 +2554,7 @@ class MainActivity : Activity() {
                 gravity = Gravity.CENTER_HORIZONTAL
             }
             val vv = HeaderVideoView(this).apply {
-                setBackgroundColor(0xFF000000.toInt())
+                setBackgroundColor(0xFF0E1116.toInt())
                 onError = { true }
                 onRetry = { toast("链接可能已过期，可返回首页重新解析") }
                 onVideoSize = { w, h -> fitVideoBox(this, w, h) }
