@@ -36,8 +36,8 @@
 
 直接下载最新 APK 安装（支持 Android 7.0+，`minSdk 24`）：
 
-- 最新版 **v1.2.0**：[app-release.apk](release/app-release.apk)（或前往 [Releases](https://github.com/ly5201314gjx/MediaParser/releases) 页下载）
-- 临时下载（保留 3 天）：https://share.lg0304.xyz/f/07db6a85-1eb1-4e60-8f93-f9b455d861b6
+- 最新版 **v1.2.1**：[app-release.apk](release/app-release.apk)（或前往 [Releases](https://github.com/ly5201314gjx/MediaParser/releases) 页下载）
+- 临时下载（保留 3 天）：https://share.lg0304.xyz/f/901920b4-c3b9-4d19-8fb0-039c8350d629
 
 > 安装包使用 debug 签名，首次安装需允许"未知来源"。
 
@@ -79,5 +79,5 @@ app/
 
 ## 版本
 
-- 当前版本：`1.2.0`（详见 [CHANGELOG.md](CHANGELOG.md)）
+- 当前版本：`1.2.1`（详见 [CHANGELOG.md](CHANGELOG.md)）
 - 包名：`com.qingjiexi.app`
