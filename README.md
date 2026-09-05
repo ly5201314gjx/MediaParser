@@ -12,6 +12,7 @@
 - **多段并行解析**：一次粘贴多段分享内容（支持不同平台混合、一行多个链接），自动拆分并行解析，结果逐卡预览。
 - **视频预览缓存**：预览过的视频自动缓存到本地，再次打开秒开免加载；支持按时间范围一键清除（清除前二次确认）。
 - **播放与预览**：内置视频播放器与图片查看器，支持缩放、翻页、保存。
+- **图集多选批量下载**：iOS 极简风底部弹层，任意勾选多张图片一键批量下载，支持全选 / 取消全选，限高滑动列表，勾选局部刷新无闪动。
 - **收藏管理**：
   - 收藏列表按分类组织，支持新建 / 移动分类。
   - **长按媒体**弹出操作面板：下载、移动到分类、取消收藏、删除记录、多选。
@@ -35,8 +36,8 @@
 
 直接下载最新 APK 安装（支持 Android 7.0+，`minSdk 24`）：
 
-- 最新版 **v1.1.0**：[app-release.apk](release/app-release.apk)（或前往 [Releases](https://github.com/ly5201314gjx/MediaParser/releases) 页下载）
-- 临时下载（保留 3 天）：https://share.lg0304.xyz/f/529dc5cd-1081-4bce-add1-9e91e9e47372
+- 最新版 **v1.2.0**：[app-release.apk](release/app-release.apk)（或前往 [Releases](https://github.com/ly5201314gjx/MediaParser/releases) 页下载）
+- 临时下载（保留 3 天）：https://share.lg0304.xyz/f/07db6a85-1eb1-4e60-8f93-f9b455d861b6
 
 > 安装包使用 debug 签名，首次安装需允许"未知来源"。
 
@@ -78,5 +79,5 @@ app/
 
 ## 版本
 
-- 当前版本：`1.1.0`（详见 [CHANGELOG.md](CHANGELOG.md)）
+- 当前版本：`1.2.0`（详见 [CHANGELOG.md](CHANGELOG.md)）
 - 包名：`com.qingjiexi.app`
