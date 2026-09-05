@@ -40,6 +40,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import android.os.Handler
@@ -127,6 +128,9 @@ class MainActivity : Activity() {
     private val tabLabels = ArrayList<TextView>()
     private lateinit var serviceStarted: java.util.concurrent.atomic.AtomicBoolean
     private var lastRender = 0L
+    /** 本次 renderCurrent 是否播放入场动画（同页刷新 / 详情页进出不播 → 修复点按闪动） */
+    private var pageAnim = true
+    private var prevPvMode: String? = null
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context?, intent: Intent?) {
@@ -136,7 +140,18 @@ class MainActivity : Activity() {
                         val ok = intent.getBooleanExtra(MediaService.EXTRA_PARSE_OK, false)
                         val hid = intent.getLongExtra(MediaService.EXTRA_HISTORY_ID, -1)
                         val err = intent.getStringExtra(MediaService.EXTRA_PARSE_ERROR) ?: ""
-                        onParseDone(ok, hid, err)
+                        val ids = if (intent.hasExtra(MediaService.EXTRA_PARSE_IDS))
+                            intent.getLongArrayExtra(MediaService.EXTRA_PARSE_IDS) else null
+                        onParseDone(ok, hid, err, ids)
+                    } else if (intent.hasExtra(MediaService.EXTRA_PARSE_DONE_CNT)) {
+                        // 多段解析实时进度：只更新状态行，不打断其他页面
+                        if (parseCanceled) return
+                        val d = intent.getIntExtra(MediaService.EXTRA_PARSE_DONE_CNT, 0)
+                        val t = intent.getIntExtra(MediaService.EXTRA_PARSE_TOTAL_CNT, 0)
+                        if (statusLoading && pvMode == "home") {
+                            parseLiveText = "正在并行解析 $d/$t…"
+                            renderCurrent()
+                        }
                     } else if (intent.hasExtra(MediaService.EXTRA_DL_ID)) {
                         val st = intent.getIntExtra(MediaService.EXTRA_DL_STATUS, -1)
                         val did = intent.getLongExtra(MediaService.EXTRA_DL_ID, -1)
@@ -225,7 +240,24 @@ class MainActivity : Activity() {
         ) req.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
         if (req.isNotEmpty()) requestPermissions(req.toTypedArray(), 200)
 
-        // 电池后台长时间运行权限（白名单）
+        requestBatteryIfNeeded()
+    }
+
+    /** 仅申请通知（与写存储）权限 —— 设置页"通知权限"行点击触发，不再连带弹电池优化页 */
+    private fun requestNotificationPermission() {
+        val req = ArrayList<String>()
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) req.add(Manifest.permission.POST_NOTIFICATIONS)
+        if (Build.VERSION.SDK_INT < 29 &&
+            checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
+        ) req.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        if (req.isEmpty()) { toast("通知权限已开启"); return }
+        requestPermissions(req.toTypedArray(), 200)
+    }
+
+    /** 电池后台长时间运行权限（白名单）；已授权则直接提示 */
+    private fun requestBatteryIfNeeded() {
         try {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             if (!pm.isIgnoringBatteryOptimizations(packageName)) {
@@ -326,6 +358,15 @@ class MainActivity : Activity() {
 
     private fun chevron(): GlyphView = glyph("chevron", 0xFFC7C7CC.toInt(), 2f, 16)
 
+    /** 字节数 → 可读大小文案（B / KB / MB / GB） */
+    private fun fmtSize(bytes: Long): String = when {
+        bytes <= 0 -> "0 B"
+        bytes < 1024 -> "$bytes B"
+        bytes < 1024L * 1024 -> String.format(Locale.US, "%.1f KB", bytes / 1024f)
+        bytes < 1024L * 1024 * 1024 -> String.format(Locale.US, "%.1f MB", bytes / 1024f / 1024f)
+        else -> String.format(Locale.US, "%.2f GB", bytes / 1024f / 1024f / 1024f)
+    }
+
     /** 多选圆圈：选中时显示对勾 */
     private fun selCheck(sel: Boolean, color: Int): FrameLayout {
         val f = FrameLayout(this).apply {
@@ -353,22 +394,26 @@ class MainActivity : Activity() {
     }
 
     // ---------- 底部 TabBar（真液态玻璃，对照 legado-with-MD3 AppNavigationBar 配方） ----------
-    // legado：hazeEffect(style=HazeLegado.ultraThin) = 24dp 背景模糊 + 扁平 surface 色调（非渐变）
+    // legado：hazeEffect(style=HazeLegado.ultraThin) = 24dp+ 背景模糊 + 扁平 surface 色调（非渐变）
     //        容器色完全透明；指示器仅选中时弹簧浮现、未选中 scale=0 —— 不显示任何"椭圆灰点"
     private fun buildTabBar(): FrameLayout {
         val bar = FrameLayout(this)
 
-        // 1) 真模糊玻璃层：背后内容缩小采样 → 拉伸 → RenderEffect 高斯模糊（≈24dp，同 legado haze）
+        // 1) 真模糊玻璃层：背后内容缩小采样 → 拉伸 → RenderEffect 高斯模糊（≈28dp，比 legado 更强）
         val glass = GlassBlurView(this)
         glassBlur = glass
         bar.addView(glass, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
         // 2) 扁平玻璃色调（HazeTint = surface @ lightAlpha，恒透明，非渐变）：
-        //    只做轻微提亮的"玻璃膜"，模糊透出的内容才是主角
+        //    滤镜更透 + 细顶边线 → 模糊透出的内容更"液态"，边缘有清晰投影感
         val veil = View(this).apply {
-            background = GradientDrawable().apply { setColor(0x45F2F2F7.toInt()) }
+            background = GradientDrawable().apply { setColor(0x42F2F2F7.toInt()) }
         }
         bar.addView(veil, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        val edge = View(this).apply {
+            background = GradientDrawable().apply { setColor(0x18000000.toInt()) }
+        }
+        bar.addView(edge, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1), Gravity.TOP))
 
         // 3) 三个 Tab（Icon + 指示器 + Label）：与 legado 一致，无顶部分隔线、无多余描边
         val row = LinearLayout(this).apply {
@@ -539,6 +584,12 @@ class MainActivity : Activity() {
     private fun renderCurrent() {
         val now = System.currentTimeMillis()
         lastRender = now
+        // 同页刷新（多选切换/筛选/解析进度/下载状态等）与进出详情页时，不播放入场动画：
+        // 否则整页 alpha 从 0 淡入 + 弹簧位移动画会让"点媒体 / 长按媒体"看起来闪动一下。
+        // 仅 Tab 之间的真正页面切换才保留弹簧入场转场。
+        pageAnim = prevPvMode != pvMode && prevPvMode != null &&
+            pvMode != "detail" && prevPvMode != "detail"
+        prevPvMode = pvMode
         selectChecks.clear()   // 页面重建后旧圆圈注册失效，由新构建的 cell 重新注册
         // 页面重建前释放旧页内视频播放器（全屏中的 vv 由 fsHost 单独持有，此处重建流程保证 fsHost == null）
         for (v in liveVideos) v.release()
@@ -550,14 +601,19 @@ class MainActivity : Activity() {
         val overlay = if (tabBar.visibility == View.VISIBLE || actionBar.visibility == View.VISIBLE) dp(64) else 0
         if (overlay > 0) page.setPadding(0, 0, 0, overlay)
         content.addView(page, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        // 页面切入动画：真实阻尼弹簧（semi-隐式欧拉积分），快而顺地"弹"进画面，
-        // 取代固定时长的补间 —— 对应 legado 的 spring(stiffness, dampingRatio) 手感
-        page.alpha = 0f
-        page.translationY = dp(24).toFloat()
-        val ty = SpringScaler({ page.translationY }, { v -> page.translationY = v })
-        ty.stiffness = 640f; ty.dampingRatio = 0.9f; ty.to(0f)
-        val al = SpringScaler({ page.alpha }, { v -> page.alpha = v })
-        al.stiffness = 640f; al.dampingRatio = 0.95f; al.to(1f)
+        if (pageAnim) {
+            // 页面切入动画：真实阻尼弹簧（semi-隐式欧拉积分），快而顺地"弹"进画面，
+            // 取代固定时长的补间 —— 对应 legado 的 spring(stiffness, dampingRatio) 手感
+            page.alpha = 0f
+            page.translationY = dp(24).toFloat()
+            val ty = SpringScaler({ page.translationY }, { v -> page.translationY = v })
+            ty.stiffness = 640f; ty.dampingRatio = 0.9f; ty.to(0f)
+            val al = SpringScaler({ page.alpha }, { v -> page.alpha = v })
+            al.stiffness = 640f; al.dampingRatio = 0.95f; al.to(1f)
+        } else {
+            page.alpha = 1f
+            page.translationY = 0f
+        }
         // 把"背后内容"绑定给液态玻璃层：页面滚动时实时刷新模糊
         if (::glassBlur.isInitialized) {
             glassBlur.setTarget(content)
@@ -606,6 +662,10 @@ class MainActivity : Activity() {
     // =====================================================================
     private var detailBean: MediaBean? = null
     private var homeResult: MediaBean? = null
+    /** 多段并行解析的全部结果（首页输入区下方逐卡展示） */
+    private val homeResults = ArrayList<MediaBean>()
+    /** 并行解析实时进度文案（如"正在并行解析 2/3…"） */
+    private var parseLiveText: String? = null
     private var parseStatusText = "粘贴分享内容，自动识别平台并解析"
 
     private fun buildHomePage(): View {
@@ -657,8 +717,10 @@ class MainActivity : Activity() {
                 hideKeyboard()
                 // 新解析开始 → 清空旧结果，让界面实时展示新内容
                 homeResult = null
+                homeResults.clear()
                 parseCanceled = false
                 parseBusy = true
+                parseLiveText = null
                 statusText = "正在解析，请稍候…"
                 statusLoading = true
                 parseStartTs = System.currentTimeMillis()
@@ -698,9 +760,16 @@ class MainActivity : Activity() {
         applyStatus(statusRow, spin, statusLabel)
         col.addView(statusRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12); leftMargin = dp(4) })
 
-        // 首页内联解析结果（实时预览与操作）
-        homeResult?.let { b ->
-            col.addView(buildHomeResultCard(b), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
+        // 首页内联解析结果（实时预览与操作；多段并行解析逐卡展示）
+        if (homeResults.isNotEmpty()) {
+            homeResults.forEachIndexed { idx, b ->
+                // 多卡时仅第一张自动播放预览，其余保持待机，避免多路视频同时出声
+                col.addView(buildHomeResultCard(b, idx == 0), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
+            }
+        } else {
+            homeResult?.let { b ->
+                col.addView(buildHomeResultCard(b, true), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
+            }
         }
 
         // 历史记录：筛选卡 + 分段栏 + 分组列表（与上部内容收紧间距）
@@ -715,7 +784,7 @@ class MainActivity : Activity() {
     }
 
     /** 首页内联结果卡：封面信息 + 视频实时预览 + 下载/音频操作（统一白卡框体） */
-    private fun buildHomeResultCard(b: MediaBean): LinearLayout {
+    private fun buildHomeResultCard(b: MediaBean, autoPlay: Boolean = true): LinearLayout {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = rnd(CARD, 14)
@@ -747,6 +816,7 @@ class MainActivity : Activity() {
             }
             val vv = HeaderVideoView(this).apply {
                 setBackgroundColor(0xFF000000.toInt())
+                this.autoPlay = autoPlay   // 多卡并行时仅首卡自动播放，其余点击后播放
                 onError = { true }
                 onRetry = { toast("链接可能已过期，可回到输入框重新解析") }
                 onVideoSize = { w, h -> fitVideoBox(this, w, h) }
@@ -980,6 +1050,7 @@ class MainActivity : Activity() {
         parseBusy = false
         statusLoading = false
         parseStartTs = 0
+        parseLiveText = null
         statusText = "已停止解析"
         try {
             sendBroadcast(Intent(this, MediaService::class.java).setAction(MediaService.ACTION_PARSE_CANCEL))
@@ -996,7 +1067,9 @@ class MainActivity : Activity() {
             updateParseButton()
         }
         if (statusLoading) spin.visibility = View.VISIBLE else spin.visibility = View.GONE
-        label.text = if (statusLoading) "正在解析，请稍候…" else statusText
+        label.text = if (statusLoading) {
+            parseLiveText?.takeIf { it.isNotBlank() } ?: "正在解析，请稍候…"
+        } else statusText
     }
 
     private fun hideKeyboard() {
@@ -1005,16 +1078,29 @@ class MainActivity : Activity() {
     }
 
     // ---------- 解析完成 ----------
-    private fun onParseDone(ok: Boolean, hid: Long, err: String) {
+    private fun onParseDone(ok: Boolean, hid: Long, err: String, ids: LongArray? = null) {
         // 用户已手动停止：忽略迟到的结果，保持"已停止解析"状态
         if (parseCanceled) return
         statusLoading = false
         parseBusy = false
         parseStartTs = 0L
-        if (ok && hid > 0) {
-            statusText = "解析成功，可在下方直接预览与下载"
-            detailBean = DB.historyById(hid)
+        parseLiveText = null
+        if (ok && (hid > 0 || (ids != null && ids.isNotEmpty()))) {
+            // 多段解析：ids 全量；单段：仅 hid
+            val list = ArrayList<MediaBean>(ids?.size ?: 1)
+            if (ids != null && ids.isNotEmpty()) {
+                for (id in ids) DB.historyById(id)?.let { list.add(it) }
+            } else {
+                DB.historyById(hid)?.let { list.add(it) }
+            }
+            if (list.isEmpty()) { statusText = "解析失败：未取到媒体数据"; renderCurrent(); return }
+            homeResults.clear()
+            homeResults.addAll(list)
+            detailBean = homeResults.first()
             homeResult = detailBean
+            statusText = if (list.size > 1)
+                "解析成功 ${list.size} 条，可在下方分别预览与下载"
+            else "解析成功，可在下方直接预览与下载"
             pvMode = "home"
             currentTab = 0
             renderTabBar()
@@ -1562,6 +1648,76 @@ class MainActivity : Activity() {
         sheetLayer.removeAllViews()
     }
 
+    /** iOS 风格二次确认弹层：标题 + 说明 + 确认/取消（危险操作红色确认按钮，风格与全局面板一致） */
+    private fun showConfirmSheet(
+        title: String,
+        message: String,
+        confirmText: String = "确定",
+        destructive: Boolean = false,
+        onConfirm: () -> Unit
+    ) {
+        dismissSheet()   // 先收起旧层（如缓存管理面板），避免两层叠影
+        sheetShowing = true
+        val myToken = ++sheetToken
+        sheetLayer.removeAllViews()
+        sheetLayer.alpha = 1f
+        sheetLayer.visibility = View.VISIBLE
+        sheetHidTabBar = tabBar.visibility == View.VISIBLE
+        if (sheetHidTabBar) tabBar.visibility = View.GONE
+
+        val overlay = View(this).apply {
+            setBackgroundColor(0x60000000)
+            setOnClickListener { dismissSheet() }
+        }
+        val sheet = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = rnd(CARD, 16)
+        }
+        sheet.addView(tv(title, 17f, TXT, true, Gravity.CENTER),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { topMargin = dp(24) })
+        sheet.addView(tv(message, 13f, 0xFF8E8E93.toInt(), false, Gravity.CENTER),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { topMargin = dp(8); leftMargin = dp(22); rightMargin = dp(22) })
+
+        val confirmColor = if (destructive) RED else BLUE
+        val confirm = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            background = rnd(confirmColor, 14)
+            setOnClickListener {
+                dismissSheet()
+                onConfirm()
+            }
+        }
+        press(confirm)
+        confirm.addView(tv(confirmText, 17f, Color.WHITE, true, Gravity.CENTER),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52), 1f))
+        sheet.addView(confirm, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            .apply { topMargin = dp(20); leftMargin = dp(12); rightMargin = dp(12) })
+
+        val cancel = LinearLayout(this).apply {
+            gravity = Gravity.CENTER
+            background = rnd(CARD, 14)
+            setOnClickListener { dismissSheet() }
+        }
+        press(cancel)
+        cancel.addView(tv("取消", 17f, TXT, true, Gravity.CENTER),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 1f))
+        sheet.addView(cancel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            .apply { topMargin = dp(8); leftMargin = dp(12); rightMargin = dp(12); bottomMargin = dp(14) })
+
+        sheetLayer.addView(overlay, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        val lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM)
+        lp.setMargins(dp(12), 0, dp(12), dp(12))
+        sheetLayer.addView(sheet, lp)
+
+        overlay.alpha = 0f
+        overlay.animate().alpha(1f).setDuration(180).start()
+        sheet.translationY = dp(320).toFloat()
+        sheet.animate().translationY(0f).setDuration(280).setInterpolator(DecelerateInterpolator(2.6f)).start()
+    }
+
     private fun emptyState(msg: String): LinearLayout =
         LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1574,7 +1730,16 @@ class MainActivity : Activity() {
 
     /** 列表进场动画：子项依次淡入 + 上滑（stagger），提升列表质感 */
     private fun staggerIn(container: ViewGroup, baseDelay: Long = 0) {
+        // 同页刷新（pageAnim=false）直接呈现，不再重播逐项淡入 → 列表不再闪动
         val n = container.childCount
+        if (!pageAnim) {
+            for (i in 0 until n) {
+                val v = container.getChildAt(i)
+                v.alpha = 1f
+                v.translationY = 0f
+            }
+            return
+        }
         for (i in 0 until n) {
             val v = container.getChildAt(i)
             v.alpha = 0f
@@ -1924,8 +2089,20 @@ class MainActivity : Activity() {
         row(gPower, "bolt", ORANGE, "电池后台运行权限", "允许后台持续解析与下载（建议开启）",
             { requestBatteryOptimization() })
         row(gPower, "bell", BLUE, "通知权限", "解析与下载进度实时通知",
-            { requestPermissionsAtLaunch() }, last = true)
+            { requestNotificationPermission() }, last = true)
         col.addView(gPower, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) })
+
+        // ---- 缓存管理 ----
+        val cacheBytes = VideoCache.totalBytes()
+        val cacheOn = VideoCache.enabled(this)
+        val gCache = groupCard()
+        row(gCache, "download", TEAL, "缓存管理",
+            if (cacheBytes > 0) buildString {
+                if (cacheOn) append("自动缓存已开启 · ") else append("自动缓存已关闭 · ")
+                append("已用 ").append(fmtSize(cacheBytes))
+            } else if (cacheOn) "自动缓存已开启 · 暂无缓存" else "自动缓存已关闭",
+            { showCacheSheet() }, last = true)
+        col.addView(gCache, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) })
 
         val gAbout = groupCard()
         row(gAbout, "info", BLUE, "关于轻解析", "版本 $ver · 介绍与开源项目",
@@ -2055,6 +2232,138 @@ class MainActivity : Activity() {
         sheet.animate().translationY(0f).setDuration(280).setInterpolator(DecelerateInterpolator(2.6f)).start()
     }
 
+    /** 缓存管理面板：自动缓存开关 + 缓存大小 + 清除（近1天/近7天/全部），iOS 极简风同全局面板 */
+    private fun showCacheSheet() {
+        dismissSheet()
+        sheetShowing = true
+        sheetLayer.removeAllViews()
+        sheetLayer.alpha = 1f
+        sheetLayer.visibility = View.VISIBLE
+        sheetHidTabBar = tabBar.visibility == View.VISIBLE
+        if (sheetHidTabBar) tabBar.visibility = View.GONE
+
+        val overlay = View(this).apply {
+            setBackgroundColor(0x60000000)
+            setOnClickListener { dismissSheet() }
+        }
+        val sheet = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = rnd(CARD, 16)
+        }
+
+        sheet.addView(tv("缓存管理", 18f, TXT, true, Gravity.CENTER),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(22) })
+        sheet.addView(tv("视频预览自动缓存到本地，再次打开免加载", 12f, 0xFFAEAEB2.toInt(), false, Gravity.CENTER),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(5) })
+
+        // ---- 开关 + 缓存大小 ----
+        val gInfo = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = rnd(CARD, 14)
+        }
+        val sw = Switch(this).apply {
+            isChecked = VideoCache.enabled(this@MainActivity)
+            setOnCheckedChangeListener { _, on ->
+                VideoCache.setEnabled(this@MainActivity, on)
+                toast(if (on) "已开启自动缓存" else "已关闭自动缓存")
+            }
+        }
+        val swRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), 0, dp(14), 0)
+            setOnClickListener { sw.toggle() }
+        }
+        swRow.addView(tv("自动缓存视频", 15f, TXT, true),
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        swRow.addView(sw)
+        gInfo.addView(swRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)))
+        gInfo.addView(hairline(this), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply { leftMargin = dp(16) })
+        val sizeRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), 0, dp(16), 0)
+        }
+        sizeRow.addView(tv("缓存大小", 15f, TXT, true),
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        sizeRow.addView(tv(fmtSize(VideoCache.totalBytes()), 14f, TXT3))
+        gInfo.addView(sizeRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)))
+        sheet.addView(gInfo, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            .apply { topMargin = dp(18); leftMargin = dp(12); rightMargin = dp(12) })
+
+        // ---- 清除选项 ----
+        val gClear = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = rnd(CARD, 14)
+        }
+        val clears = listOf(
+            "近一天" to 24L * 3600,
+            "近7天" to 7L * 24 * 3600,
+            "全部" to 0L
+        )
+        val now = System.currentTimeMillis() / 1000
+        clears.forEachIndexed { i, (name, threshold) ->
+            val before = if (threshold == 0L) now else now - threshold
+            val freed = if (threshold == 0L) VideoCache.totalBytes() else DB.cacheSizeOlderThan(before)
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(16), 0, dp(14), 0)
+                setOnClickListener {
+                    // 二次确认后才真正清除，避免误触；弹层风格与全局面板一致
+                    if (freed <= 0) { toast("暂无${name}缓存可清除"); return@setOnClickListener }
+                    showConfirmSheet(
+                        title = "清除${name}缓存",
+                        message = buildString {
+                            append("将删除超过${if (threshold == 0L) "全部时间" else name}的缓存视频，预计释放 ")
+                                .append(fmtSize(freed))
+                            append("\n清除后再次打开视频需要重新加载，是否继续？")
+                        },
+                        confirmText = "清除",
+                        destructive = true
+                    ) {
+                        val n = VideoCache.clearOlderThan(this@MainActivity, threshold)
+                        toast("已清除 $n 项缓存 · 释放 ${fmtSize(freed)}")
+                        renderCurrent()
+                    }
+                }
+            }
+            press(row)
+            val titleTv = tv(if (threshold == 0L) "清除全部缓存" else "清除${name}缓存", 15f, TXT, true)
+            row.addView(titleTv, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            row.addView(tv(if (freed > 0) "≈ ${fmtSize(freed)}" else "无", 13f, TXT3),
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(4) })
+            row.addView(chevron(), LinearLayout.LayoutParams(dp(16), dp(16)))
+            gClear.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50)))
+            if (i != clears.lastIndex)
+                gClear.addView(hairline(this), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply { leftMargin = dp(16) })
+        }
+        sheet.addView(gClear, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            .apply { topMargin = dp(8); leftMargin = dp(12); rightMargin = dp(12) })
+
+        // 关闭（固定底部）
+        val cancel = LinearLayout(this).apply {
+            gravity = Gravity.CENTER
+            background = rnd(CARD, 14)
+            setOnClickListener { dismissSheet() }
+        }
+        press(cancel)
+        cancel.addView(tv("关闭", 17f, TXT, true, Gravity.CENTER),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56), 1f))
+        sheet.addView(cancel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            .apply { topMargin = dp(8); leftMargin = dp(12); rightMargin = dp(12); bottomMargin = dp(14) })
+
+        sheetLayer.addView(overlay, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        val lp = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM)
+        lp.setMargins(dp(12), 0, dp(12), dp(12))
+        sheetLayer.addView(sheet, lp)
+
+        overlay.alpha = 0f
+        overlay.animate().alpha(1f).setDuration(180).start()
+        sheet.translationY = dp(360).toFloat()
+        sheet.animate().translationY(0f).setDuration(280).setInterpolator(DecelerateInterpolator(2.6f)).start()
+    }
+
     private fun buildRecyclePage(): View {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
@@ -2174,8 +2483,17 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)))
         top.addView(tv(platformName(b.platform).ifEmpty { "详情" }, 13f, TXT3, true, Gravity.CENTER),
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        top.addView(glyph("more", 0xFFC7C7CC.toInt(), 2.4f, 18),
-            LinearLayout.LayoutParams(dp(40), dp(44)).apply { gravity = Gravity.CENTER })
+        val moreBtn = glyph("more", 0xFFC7C7CC.toInt(), 2.4f, 18).apply {
+            setOnClickListener {
+                // 打开原始作品页；无原链接时退化为分享
+                if (b.sourceUrl.isNotBlank()) {
+                    runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(b.sourceUrl))) }
+                        .onFailure { toast("无法打开原链接") }
+                } else shareMedia(b)
+            }
+        }
+        press(moreBtn)
+        top.addView(moreBtn, LinearLayout.LayoutParams(dp(40), dp(44)).apply { gravity = Gravity.CENTER })
         col.addView(top, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44)))
 
         val scroll = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }

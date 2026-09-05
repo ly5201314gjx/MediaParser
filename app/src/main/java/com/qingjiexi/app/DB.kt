@@ -298,6 +298,67 @@ object DB {
         db.execSQL("DELETE FROM recycle")
     }
 
+    // ================= 视频预览缓存 =================
+    fun addCache(url: String, path: String, size: Long) {
+        val cv = ContentValues().apply {
+            put("url", url)
+            put("path", path)
+            put("size", size)
+            put("timestamp", System.currentTimeMillis() / 1000)
+        }
+        db.insertWithOnConflict("cache", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+    }
+
+    fun cacheSize(): Long {
+        db.rawQuery("SELECT COALESCE(SUM(size),0) FROM cache", null).use {
+            if (it.moveToFirst()) return it.getLong(0)
+        }
+        return 0L
+    }
+
+    fun cacheCount(): Int {
+        db.rawQuery("SELECT COUNT(*) FROM cache", null).use {
+            if (it.moveToFirst()) return it.getInt(0)
+        }
+        return 0
+    }
+
+    /** 指定时间阈值之前的缓存总字节数（用于面板预估可释放空间） */
+    fun cacheSizeOlderThan(beforeSec: Long): Long {
+        db.rawQuery("SELECT COALESCE(SUM(size),0) FROM cache WHERE timestamp<?",
+            arrayOf(beforeSec.toString())).use {
+            if (it.moveToFirst()) return it.getLong(0)
+        }
+        return 0L
+    }
+
+    /** 查询指定时间阈值之前的缓存记录（timestamp 秒级） */
+    fun cachesOlderThan(beforeSec: Long): List<CacheBean> {
+        val out = ArrayList<CacheBean>()
+        db.query("cache", null, "timestamp<?", arrayOf(beforeSec.toString()), null, null, null).use { c ->
+            while (c.moveToNext()) out.add(fromCacheCursor(c))
+        }
+        return out
+    }
+
+    fun deleteCacheById(id: Long) {
+        db.execSQL("DELETE FROM cache WHERE id=?", arrayOf(id.toString()))
+    }
+
+    fun deleteCacheByUrl(url: String) {
+        db.execSQL("DELETE FROM cache WHERE url=?", arrayOf(url))
+    }
+
+    /** 文件已不存在时清理脏记录 */
+    fun deleteCacheByPath(path: String) {
+        db.execSQL("DELETE FROM cache WHERE path=?", arrayOf(path))
+    }
+
+    private fun fromCacheCursor(c: Cursor): CacheBean = CacheBean(
+        id = c.getLong(0), url = c.getString(1), path = c.getString(2),
+        size = c.getLong(3), timestamp = c.getLong(4)
+    )
+
     // ================= helpers =================
     private fun fromHistoryCursor(c: Cursor): MediaBean = MediaBean(
         id = c.getLong(c.getColumnIndexOrThrow("id")),
@@ -421,7 +482,15 @@ class RecycleBean(
     var deletedAt: Long = 0
 )
 
-class DBHelper(context: Context) : SQLiteOpenHelper(context, "media_parser.db", null, 1) {
+class CacheBean(
+    var id: Long = 0,
+    var url: String = "",
+    var path: String = "",
+    var size: Long = 0,
+    var timestamp: Long = 0
+)
+
+class DBHelper(context: Context) : SQLiteOpenHelper(context, "media_parser.db", null, 2) {
     override fun onCreate(d: SQLiteDatabase) {
         d.execSQL("CREATE TABLE history(" +
             "id INTEGER PRIMARY KEY AUTOINCREMENT," +
@@ -441,7 +510,15 @@ class DBHelper(context: Context) : SQLiteOpenHelper(context, "media_parser.db", 
             "status INTEGER DEFAULT 0, created_at INTEGER)")
         d.execSQL("CREATE TABLE recycle(" +
             "id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, title TEXT, payload TEXT, deleted_at INTEGER)")
+        d.execSQL("CREATE TABLE cache(" +
+            "id INTEGER PRIMARY KEY AUTOINCREMENT," +
+            "url TEXT UNIQUE, path TEXT, size INTEGER DEFAULT 0, timestamp INTEGER DEFAULT 0)")
     }
 
-    override fun onUpgrade(d: SQLiteDatabase, o: Int, n: Int) {}
+    override fun onUpgrade(d: SQLiteDatabase, o: Int, n: Int) {
+        // v1 → v2：新增视频预览缓存表（幂等，防重复建表）
+        d.execSQL("CREATE TABLE IF NOT EXISTS cache(" +
+            "id INTEGER PRIMARY KEY AUTOINCREMENT," +
+            "url TEXT UNIQUE, path TEXT, size INTEGER DEFAULT 0, timestamp INTEGER DEFAULT 0)")
+    }
 }

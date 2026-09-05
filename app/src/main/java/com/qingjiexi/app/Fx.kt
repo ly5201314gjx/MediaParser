@@ -7,8 +7,10 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.Shader
 import android.os.Build
+import android.os.SystemClock
 import android.view.Choreographer
 import android.view.View
+import android.view.ViewTreeObserver
 import kotlin.math.abs
 import kotlin.math.sqrt
 
@@ -29,9 +31,29 @@ class GlassBlurView(context: Context) : View(context) {
     private val useBlur: Boolean
 
     /** 采样降采样倍率：越小性能越好；画面经 downSample 拉伸后由 RenderEffect 在"最终输出"上做高斯模糊
-     *  （模糊半径 = dp(24f) 直接在输出像素空间生效，≈ legado haze 的 24dp，绝不能乘 downSample，
+     *  （模糊半径 = dp(28f) 直接在输出像素空间生效，≈ legado haze 的 24dp，绝不能乘 downSample，
      *    否则半径将超过栏高 → 整条糊成雾面，这正是之前"不像真液态玻璃"的根因） */
     private val downSample = 3
+
+    // ---- 实时模糊刷新（节流） ----
+    // 玻璃快照默认只在自身 invalidate 时重绘，内容滚动/切换时模糊是"死"的 → 看起来像贴图而非玻璃。
+    // 这里监听目标内容树的 onDraw：内容每帧绘制时，以 ~66ms 间隔（≈15fps）跟随刷新快照，
+    // 让模糊下的内容"活"起来，同时把采样绘制成本压在可接受范围（downSample=3 时采样位图极小）。
+    private var lastSnapAt = 0L
+    private var pendingSnap = false
+    private val contentDrawListener = object : ViewTreeObserver.OnDrawListener {
+        override fun onDraw() {
+            if (pendingSnap) return
+            val now = SystemClock.uptimeMillis()
+            if (now - lastSnapAt < 66) return
+            lastSnapAt = now
+            pendingSnap = true
+            post {
+                pendingSnap = false
+                if (visibility == View.VISIBLE && width > 0 && height > 0) invalidate()
+            }
+        }
+    }
 
     init {
         var ok = false
@@ -56,7 +78,7 @@ class GlassBlurView(context: Context) : View(context) {
                 Float::class.javaPrimitiveType, Float::class.javaPrimitiveType,
                 Shader.TileMode::class.java
             )
-            val radius = dp(24f)
+            val radius = dp(28f)
             val effect = create.invoke(null, radius, radius, Shader.TileMode.CLAMP)
             View::class.java.getMethod("setRenderEffect", effectCls).invoke(this, effect)
             true
@@ -67,9 +89,13 @@ class GlassBlurView(context: Context) : View(context) {
 
     private fun dp(v: Float): Float = v * resources.displayMetrics.density
 
-    /** 绑定"背后要被透出来的内容 View" */
+    /** 绑定"背后要被透出来的内容 View"（自动挂/卸 onDraw 监听，实现实时模糊） */
     fun setTarget(v: View?) {
-        if (target !== v) { target = v; invalidate() }
+        if (target === v) return
+        target?.viewTreeObserver?.removeOnDrawListener(contentDrawListener)
+        target = v
+        v?.viewTreeObserver?.addOnDrawListener(contentDrawListener)
+        invalidate()
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -97,6 +123,7 @@ class GlassBlurView(context: Context) : View(context) {
 
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
+        target?.viewTreeObserver?.removeOnDrawListener(contentDrawListener)
         snap?.recycle()
         snap = null
     }

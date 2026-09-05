@@ -40,6 +40,7 @@ class MediaService : Service() {
         const val ACTION_PARSE = "com.qingjiexi.app.PARSE"
         const val ACTION_PARSE_CANCEL = "com.qingjiexi.app.PARSE_CANCEL"
         const val ACTION_DOWNLOAD = "com.qingjiexi.app.DOWNLOAD"
+        const val ACTION_CACHE_URL = "com.qingjiexi.app.CACHE_URL"
         const val ACTION_PAUSE = "com.qingjiexi.app.PAUSE"
         const val ACTION_RESUME = "com.qingjiexi.app.RESUME"
         const val ACTION_CANCEL = "com.qingjiexi.app.CANCEL"
@@ -54,6 +55,18 @@ class MediaService : Service() {
         const val EXTRA_PARSE_OK = "parse_ok"
         const val EXTRA_PARSE_ERROR = "parse_error"
         const val EXTRA_HISTORY_ID = "history_id"
+        /** 多段并行解析：进度（已完成段数 / 总段数） */
+        const val EXTRA_PARSE_DONE_CNT = "parse_done_cnt"
+        const val EXTRA_PARSE_TOTAL_CNT = "parse_total_cnt"
+        /** 多段并行解析：全部成功的历史 id 数组 */
+        const val EXTRA_PARSE_IDS = "parse_ids"
+        /** 并行解析时的 DB 写入锁：SQLite 单实例并发写可能锁库 */
+        private val DB_LOCK = Any()
+        private const val MAX_PARALLEL_PARSE = 4
+        /** 多段拆分：行内 http(s) 链接提取正则（预编译，避免每次解析重建） */
+        private val urlRe = Regex("https?://\\S+")
+        /** 分享文案常以标点收尾，提取链接时统一截掉 */
+        private val TRAILING_PUNCTS = charArrayOf('。', '，', ',', '、', '）', ')', '】', ']', '}', '！', '!', '；', ';', '…', '·', '\'', '"')
 
         private const val CH_SERVICE = "svc"
         private const val CH_PARSE = "parse"
@@ -73,6 +86,13 @@ class MediaService : Service() {
             i.putExtra("url", url).putExtra("file", fileName).putExtra("kind", kind)
             i.putExtra("hid", historyId)
             startCompat(service, i)
+        }
+        /** 静默缓存视频到本地（不弹通知；服务内去重 + 限流）；缓存开关关闭时直接忽略，不拉起服务 */
+        fun cacheVideo(service: Context, url: String) {
+            if (url.isBlank()) return
+            if (!VideoCache.enabled(service)) return
+            startCompat(service, Intent(service, MediaService::class.java)
+                .setAction(ACTION_CACHE_URL).putExtra("url", url))
         }
         fun pause(service: Context, id: Long) = cmd(service, ACTION_PAUSE, id)
         fun resume(service: Context, id: Long) = cmd(service, ACTION_RESUME, id)
@@ -94,10 +114,14 @@ class MediaService : Service() {
     private val tasks = HashMap<Long, DownloadTask>()
     private val ui = Handler(Looper.getMainLooper())
 
-    // ---------- 分片并行下载参数 ----------
-    private val MAX_CHUNK_THREADS = 12
-    private val MIN_CHUNK_SIZE = 4L * 1024 * 1024
-    private val MIN_CHUNKED_DOWNLOAD = 6L * 1024 * 1024
+    // ---------- 分片并行下载参数（提速：更多线程 + 更小分片 + 更大缓冲区） ----------
+    private val MAX_CHUNK_THREADS = 16      // 原 12：提升并发上限
+    private val MIN_CHUNK_SIZE = 2L * 1024 * 1024      // 原 4MB：小文件也能吃满多线程
+    private val MIN_CHUNKED_DOWNLOAD = 4L * 1024 * 1024 // 原 6MB：更早进入分片加速
+    private val CONNECT_TIMEOUT_MS = 15000  // 原 20s：失败更快回落重试
+    private val READ_TIMEOUT_MS = 25000     // 原 30s：卡死连接更快超时
+    private val STREAM_BUF = 256 * 1024     // 流式缓冲 原 64KB → 减少系统调用
+    private val CHUNK_BUF = 256 * 1024      // 分片缓冲 原 128KB → 提升单线程吞吐
 
     // ---------- lifecycle ----------
     override fun onBind(intent: Intent?): IBinder? = null
@@ -124,6 +148,10 @@ class MediaService : Service() {
                 val file = intent.getStringExtra("file") ?: "media.mp4"
                 val kind = intent.getStringExtra("kind") ?: "video"
                 startDownload(url, file, kind, intent.getLongExtra("hid", 0), 0)
+            }
+            ACTION_CACHE_URL -> {
+                val url = intent.getStringExtra("url") ?: ""
+                if (url.isNotEmpty()) startCacheVideo(url)
             }
             ACTION_PAUSE -> tasks[intent.getLongExtra(EXTRA_DL_ID, -1)]?.paused = true
             ACTION_RESUME -> {
@@ -224,70 +252,152 @@ class MediaService : Service() {
     // ---------- 解析 ----------
     private fun doParse(text: String) {
         if (text.isBlank()) return
-        parseNotify("正在解析", "正在识别链接并获取媒体信息…")
+        val entries = splitEntries(text)
+        val total = entries.size
+        parseNotify("正在解析", if (total > 1) "识别到 ${total} 段内容，并行解析中…" else "正在识别链接并获取媒体信息…")
         Thread {
-            val json = try { NativeLib.parseText(text) } catch (e: Throwable) {
-                "{\"ok\":false,\"error\":\"native error: ${e.message}\"}"
-            }
-            var historyId = -1L
-            var ok = false
-            var errMsg = ""
-            try {
-                val j = JSONObject(json)
-                ok = j.optBoolean("ok", false)
-                if (ok) {
-                    val data = j.optJSONObject("data")
-                    if (data != null) {
-                        val h = MediaBean().apply {
-                            platform = data.optString("platform", "")
-                            platformName = data.optString("platform_name", "")
-                            title = data.optString("title", "")
-                            author = data.optString("author", "")
-                            cover = data.optString("cover", "")
-                            sourceUrl = data.optString("source_url", "")
-                            parsedAt = data.optLong("timestamp", 0)
-                            val videos = data.optJSONArray("videos") ?: JSONArray()
-                            if (videos.length() > 0) {
-                                val first = videos.optJSONObject(0)
-                                videoUrl = first?.optString("url", "") ?: ""
-                                quality = first?.optString("quality", "") ?: ""
+            if (total == 1) {
+                val r = parseEntry(entries[0])
+                ui.post {
+                    try {
+                        updateServiceNotify()
+                        val cancelled = r.err == "解析已取消"
+                        if (!cancelled) {
+                            if (r.ok && r.hid >= 0) {
+                                val h = DB.historyById(r.hid)
+                                parseNotify("解析成功 · " + (h?.platformName ?: ""),
+                                    (h?.title ?: "").ifEmpty { "已保存到历史记录" })
+                            } else {
+                                parseNotify("解析失败", r.err)
                             }
-                            imageUrls = data.optJSONArray("images") ?: JSONArray()
-                            audioUrls = data.optJSONArray("audios") ?: JSONArray()
+                        } else {
+                            updateServiceNotify()
                         }
-                        historyId = DB.addHistory(h)
+                    } finally {
+                        broadcast { it.putExtra(EXTRA_PARSE_OK, r.ok)
+                            .putExtra(EXTRA_HISTORY_ID, r.hid)
+                            .putExtra(EXTRA_PARSE_IDS, if (r.ok) longArrayOf(r.hid) else LongArray(0))
+                            .putExtra(EXTRA_PARSE_ERROR, r.err) }
                     }
-                } else {
-                    errMsg = j.optString("error", "未知错误")
                 }
-            } catch (e: Exception) {
-                errMsg = e.message ?: "解析异常"
+                return@Thread
             }
-            val finalOk = ok; val finalId = historyId; val finalErr = errMsg
-            val cancelled = errMsg == "解析已取消"
+
+            // 多段内容：固定线程池并行解析，完成后一次性广播全部结果
+            val ids = LongArray(total) { -1 }
+            val errors = java.util.Collections.synchronizedList(ArrayList<String>())
+            val done = java.util.concurrent.atomic.AtomicInteger(0)
+            val pool = java.util.concurrent.Executors.newFixedThreadPool(minOf(MAX_PARALLEL_PARSE, total))
+            for (i in entries.indices) {
+                val idx = i
+                pool.submit {
+                    val r = parseEntry(entries[idx])
+                    synchronized(ids) {
+                        if (r.ok) ids[idx] = r.hid else if (r.err.isNotBlank()) errors.add(r.err)
+                    }
+                    // 每完成一段推送实时进度（首段 progress 在 1/total，避免 final 重复）
+                    val d = done.incrementAndGet()
+                    if (d < total) broadcast { it.putExtra(EXTRA_PARSE_DONE_CNT, d).putExtra(EXTRA_PARSE_TOTAL_CNT, total) }
+                }
+            }
+            pool.shutdown()
+            pool.awaitTermination(180, java.util.concurrent.TimeUnit.SECONDS)
             ui.post {
+                // 在 try/finally 之外声明，finally 块才能引用（块级作用域）
+                val okIds = ids.filter { it >= 0 }
+                val ok = okIds.isNotEmpty()
+                val errStr = when {
+                    ok -> ""
+                    errors.isNotEmpty() -> errors.joinToString("；")
+                    else -> "未知错误"
+                }
                 try {
                     updateServiceNotify()
-                    if (!cancelled) {
-                        if (finalOk && finalId >= 0) {
-                            val h = DB.historyById(finalId)
-                            parseNotify("解析成功 · " + (h?.platformName ?: ""),
-                                (h?.title ?: "").ifEmpty { "已保存到历史记录" })
-                        } else {
-                            parseNotify("解析失败", finalErr)
-                        }
+                    if (!ok) {
+                        parseNotify("解析失败", errStr)
+                    } else if (okIds.size == total) {
+                        parseNotify("全部解析成功 · ${total} 条", "已保存到历史记录，可在下方预览与下载")
                     } else {
-                        updateServiceNotify()
+                        parseNotify("部分成功 · ${okIds.size}/${total} 条", "失败的段落已汇总到结果提示")
                     }
                 } finally {
-                    // 无论成功失败/是否异常，都必须把结果广播给界面，避免首页一直停留在"正在解析"
-                    broadcast { it.putExtra(EXTRA_PARSE_OK, finalOk)
-                        .putExtra(EXTRA_HISTORY_ID, finalId)
-                        .putExtra(EXTRA_PARSE_ERROR, finalErr) }
+                    broadcast {
+                        it.putExtra(EXTRA_PARSE_OK, ok)
+                        it.putExtra(EXTRA_HISTORY_ID, okIds.firstOrNull() ?: -1L)
+                        it.putExtra(EXTRA_PARSE_IDS, okIds.toLongArray())
+                        it.putExtra(EXTRA_PARSE_ERROR, errStr)
+                    }
                 }
             }
         }.start()
     }
+
+    /** 把输入文本拆分为多段待解析内容：每行一段（去重）；
+     *  一行内若有多个独立 http(s) 链接且夹杂文字极少（非口令包装），则按链接摊开成多段，
+     *  让"一行贴多个链接"也能并行解析；口令行（含平台文字）整体保留交给原生核心提取。 */
+    private fun splitEntries(text: String): List<String> {
+        val out = ArrayList<String>()
+        for (raw in text.replace("\r", "").split("\n")) {
+            val line = raw.trim()
+            if (line.isEmpty()) continue
+            // 行尾清理：去掉中文/英文常见标点结尾，避免 URL 末尾粘连标点（分享文案常以标点收尾）
+            val urls = urlRe.findAll(line).map { it.value.trimEnd(*TRAILING_PUNCTS) }.toList()
+            if (urls.size > 1) {
+                // 非 URL 文本占比 ≤ 1/2 视为"纯链接列表"（如逗号/空格分隔的多链接），摊开解析
+                val textOnly = line.length - urls.sumOf { it.length }
+                if (textOnly <= line.length / 2) {
+                    out.addAll(urls)
+                    continue
+                }
+            }
+            out.add(line)
+        }
+        return out.distinct()
+    }
+
+    /** 单段解析（可在多个线程并发调用；DB 写入串行化避免 SQLite 锁库） */
+    private fun parseEntry(text: String): ParseOutcome {
+        val json = try { NativeLib.parseText(text) } catch (e: Throwable) {
+            "{\"ok\":false,\"error\":\"native error: ${e.message}\"}"
+        }
+        var historyId = -1L
+        var ok = false
+        var errMsg = ""
+        try {
+            val j = JSONObject(json)
+            ok = j.optBoolean("ok", false)
+            if (ok) {
+                val data = j.optJSONObject("data")
+                if (data != null) {
+                    val h = MediaBean().apply {
+                        platform = data.optString("platform", "")
+                        platformName = data.optString("platform_name", "")
+                        title = data.optString("title", "")
+                        author = data.optString("author", "")
+                        cover = data.optString("cover", "")
+                        sourceUrl = data.optString("source_url", "")
+                        parsedAt = data.optLong("timestamp", 0)
+                        val videos = data.optJSONArray("videos") ?: JSONArray()
+                        if (videos.length() > 0) {
+                            val first = videos.optJSONObject(0)
+                            videoUrl = first?.optString("url", "") ?: ""
+                            quality = first?.optString("quality", "") ?: ""
+                        }
+                        imageUrls = data.optJSONArray("images") ?: JSONArray()
+                        audioUrls = data.optJSONArray("audios") ?: JSONArray()
+                    }
+                    synchronized(DB_LOCK) { historyId = DB.addHistory(h) }
+                }
+            } else {
+                errMsg = j.optString("error", "未知错误")
+            }
+        } catch (e: Exception) {
+            errMsg = e.message ?: "解析异常"
+        }
+        return ParseOutcome(ok, historyId, errMsg)
+    }
+
+    private data class ParseOutcome(val ok: Boolean, val hid: Long, val err: String)
 
     // ---------- 断点下载 ----------
     private inner class DownloadTask(val id: Long) {
@@ -390,8 +500,8 @@ class MediaService : Service() {
             val bytesBefore = offset
             try {
                 conn = URL(dl.url).openConnection() as HttpURLConnection
-                conn.connectTimeout = 20000
-                conn.readTimeout = 30000
+                conn.connectTimeout = CONNECT_TIMEOUT_MS
+                conn.readTimeout = READ_TIMEOUT_MS
                 conn.setRequestProperty("User-Agent", UA_PC)
                 applyReferer(conn, dl.url)
                 if (offset > 0) conn.setRequestProperty("Range", "bytes=$offset-")
@@ -411,7 +521,7 @@ class MediaService : Service() {
                 }
                 val raf = RandomAccessFile(file, "rw")
                 raf.seek(offset)
-                val buf = ByteArray(64 * 1024)
+                val buf = ByteArray(STREAM_BUF)
                 val now = System.currentTimeMillis()
                 while (!task.cancelled && !task.paused) {
                     val n = input.read(buf)
@@ -479,8 +589,8 @@ class MediaService : Service() {
 
     private fun urlConn(dl: DownloadBean): HttpURLConnection {
         val c = URL(dl.url).openConnection() as HttpURLConnection
-        c.connectTimeout = 20000
-        c.readTimeout = 30000
+        c.connectTimeout = CONNECT_TIMEOUT_MS
+        c.readTimeout = READ_TIMEOUT_MS
         c.useCaches = false
         c.instanceFollowRedirects = true
         c.setRequestProperty("User-Agent", UA_PC)
@@ -548,7 +658,7 @@ class MediaService : Service() {
                     val raf = RandomAccessFile(file, "rw")
                     try {
                         raf.seek(from)
-                        val buf = ByteArray(128 * 1024)
+                        val buf = ByteArray(CHUNK_BUF)
                         var attempts = 0
                         while (from < end && !task.cancelled && !task.paused) {
                             var connBytes = 0L
@@ -666,6 +776,155 @@ class MediaService : Service() {
             tmp.writeText(sb.toString())
             if (!tmp.renameTo(meta) && meta.exists()) meta.delete()
         } catch (_: Exception) {}
+    }
+
+    // ---------- 静默预览缓存（无通知、无断点；后台分片下载到 cacheDir，下次播放直接命中本地） ----------
+    private val cacheSet = HashSet<String>()          // 正在缓存的 URL（去重）
+    private val MAX_CONCURRENT_CACHE = 3              // 同时最多 3 个缓存任务，避免抢带宽
+
+    private fun startCacheVideo(url: String) {
+        if (url.isBlank()) return
+        if (!VideoCache.enabled(this)) return
+        // 已缓存 / 本地已有完整文件 → 不再下载
+        if (VideoCache.localFile(this, url) != null) return
+        synchronized(cacheSet) {
+            if (cacheSet.size >= MAX_CONCURRENT_CACHE || !cacheSet.add(url)) return
+        }
+        Thread {
+            try {
+                val file = VideoCache.fileFor(this, url)
+                if (!file.exists() || file.length() == 0L) fetchForCache(url, file)
+                if (file.exists() && file.length() > 0) {
+                    DB.addCache(url, file.absolutePath, file.length())
+                }
+            } catch (_: Exception) {
+            } finally {
+                synchronized(cacheSet) { cacheSet.remove(url) }
+            }
+        }.apply { name = "cache-job"; start() }
+    }
+
+    /** 缓存下载：探测 → 分片并行（Range 支持且够大） / 单流回退 */
+    private fun fetchForCache(url: String, file: File): Boolean {
+        val probe = probeUrl(url)
+        if (probe.total >= MIN_CHUNKED_DOWNLOAD && probe.range) {
+            if (chunkedFetch(url, file, probe.total)) return true
+        }
+        return streamFetch(url, file)
+    }
+
+    /** 探测缓存目标：文件总大小 + 是否支持 Range */
+    private fun probeUrl(url: String): Probe {
+        var conn: HttpURLConnection? = null
+        try {
+            conn = cacheConn(url)
+            conn.setRequestProperty("Range", "bytes=0-101")
+            conn.connect()
+            val code = conn.responseCode
+            if (code == 206) {
+                val total = getRangeTotal(conn.getHeaderField("Content-Range"))
+                if (total != null && total > 0) return Probe(total, true)
+                return Probe(-1, false)
+            }
+            if (code == 200) return Probe(conn.contentLength.toLong(), false)
+        } catch (_: Exception) {}
+        finally { runCatching { conn?.disconnect() } }
+        return Probe(-1, false)
+    }
+
+    private fun cacheConn(url: String): HttpURLConnection {
+        val c = URL(url).openConnection() as HttpURLConnection
+        c.connectTimeout = CONNECT_TIMEOUT_MS
+        c.readTimeout = READ_TIMEOUT_MS
+        c.useCaches = false
+        c.instanceFollowRedirects = true
+        c.setRequestProperty("User-Agent", UA_PC)
+        applyReferer(c, url)
+        return c
+    }
+
+    /** 多线程分片缓存下载（无需断点元数据：缓存本就是可再生的） */
+    private fun chunkedFetch(url: String, file: File, total: Long): Boolean {
+        val threads = (total / MIN_CHUNK_SIZE).toInt().coerceIn(2, MAX_CHUNK_THREADS)
+        val block = total / threads
+        runCatching { file.delete() }
+        val latch = CountDownLatch(threads)
+        val failed = AtomicInteger(0)
+        for (i in 0 until threads) {
+            val start = i * block
+            val end = if (i == threads - 1) total else start + block
+            Thread {
+                var conn: HttpURLConnection? = null
+                try {
+                    var from = start
+                    val raf = RandomAccessFile(file, "rw")
+                    try {
+                        raf.seek(from)
+                        val buf = ByteArray(CHUNK_BUF)
+                        var attempts = 0
+                        while (from < end) {
+                            try {
+                                conn = cacheConn(url)
+                                conn.setRequestProperty("Range", "bytes=$from-${end - 1}")
+                                conn.connect()
+                                val code = conn.responseCode
+                                if (code != 206 && code != 200) throw java.io.IOException("HTTP $code")
+                                conn.inputStream.use { ins ->
+                                    while (from < end) {
+                                        val want = minOf(end - from, buf.size.toLong()).toInt()
+                                        val n = ins.read(buf, 0, want)
+                                        if (n < 0) break
+                                        raf.write(buf, 0, n)
+                                        from += n
+                                    }
+                                }
+                                break
+                            } catch (e: Exception) {
+                                runCatching { conn?.disconnect() }
+                                if (++attempts >= 3) { failed.incrementAndGet(); break }
+                                Thread.sleep(1000)
+                            }
+                        }
+                    } finally {
+                        runCatching { raf.close() }
+                    }
+                } catch (_: Exception) {
+                    failed.incrementAndGet()
+                } finally {
+                    runCatching { conn?.disconnect() }
+                    latch.countDown()
+                }
+            }.apply { name = "cache-chunk$i"; start() }
+        }
+        latch.await()
+        return failed.get() == 0 && file.length() == total
+    }
+
+    /** 单流缓存下载（不支持 Range / 小文件兜底） */
+    private fun streamFetch(url: String, file: File): Boolean {
+        var conn: HttpURLConnection? = null
+        return try {
+            conn = cacheConn(url)
+            conn.connect()
+            val code = conn.responseCode
+            if (code !in 200..299) return false
+            runCatching { file.delete() }
+            val ins = conn.inputStream ?: return false
+            FileOutputStream(file).use { out ->
+                val buf = ByteArray(STREAM_BUF)
+                while (true) {
+                    val n = ins.read(buf)
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                }
+            }
+            file.length() > 0
+        } catch (_: Exception) {
+            runCatching { file.delete() }
+            false
+        } finally {
+            runCatching { conn?.disconnect() }
+        }
     }
 
     private fun updateDone(dl: DownloadBean, total: Long, sized: Long) {

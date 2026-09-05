@@ -23,6 +23,7 @@ import android.widget.ProgressBar
 import android.widget.SeekBar
 import android.widget.TextView
 import java.io.IOException
+import java.io.File
 
 /** 通用浏览器 UA */
 const val GS_UA: String =
@@ -398,7 +399,14 @@ class HeaderVideoView(context: Context) : FrameLayout(context), SurfaceHolder.Ca
                 put("User-Agent", GS_UA)
                 if (referer.isNotEmpty()) put("Referer", referer)
             }
-            p.setDataSource(context, Uri.parse(url), headers)
+            // 视频预览缓存：命中本地直接播放（秒开免加载）；未命中走直链并通知服务后台静默缓存
+            val cached = if (VideoCache.enabled(context)) VideoCache.localFile(context, url) else null
+            if (cached != null) {
+                runCatching { p.setDataSource(context, Uri.fromFile(File(cached)), HashMap()) }
+            } else {
+                p.setDataSource(context, Uri.parse(url), headers)
+                MediaService.cacheVideo(context, url)
+            }
             p.setOnPreparedListener {
                 prepared = true
                 val vw = p.videoWidth; val vh = p.videoHeight
